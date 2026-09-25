@@ -98,6 +98,11 @@ local function makeCorpse(character)
 	local humanoid = copy:FindFirstChildOfClass("Humanoid")
 	if humanoid then
 		humanoid.BreakJointsOnDeath = false
+		--  El Humanoid clonado no hereda el estado de ragdoll de ACS y vuelve a
+		--  "Running": sostiene el torso a la altura de pie y el cuerpo queda
+		--  colgado en el aire. Sin maquina de estados no aplica fuerzas.
+		humanoid.EvaluateStateMachine = false
+		humanoid.PlatformStand = true
 		humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
 		humanoid.HealthDisplayType = Enum.HumanoidHealthDisplayType.AlwaysOff
 	end
@@ -143,6 +148,8 @@ local function watch(character)
 	humanoid.Died:Connect(function()
 		if not corpsesActive() then return end
 		task.wait(RAGDOLL_WAIT)
+		--  La ronda pudo terminar durante la espera (y la carpeta ya se limpio).
+		if not corpsesActive() then return end
 		makeCorpse(character)
 	end)
 end
