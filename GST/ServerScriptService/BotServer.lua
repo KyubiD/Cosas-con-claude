@@ -21,8 +21,21 @@
 --      BotControl:Invoke("removeAll")  -> ok, mensaje
 --      BotControl:Invoke("count")      -> ok, numero
 --
---  PENDIENTE (fase 2): abatido / revivir de bots, climas especiales sobre
---  los bots, killcam siguiendo al bot.
+--  IA v2 (25/09/2026): movimiento y combate mas humanos.
+--    · parkour: salta obstaculos, se trepa a bordes y cruza huecos; esquiva
+--      a otros personajes y sigue un camino recto cuando puede (sin zigzag)
+--    · caminos: tres agentes (normal, con saltos, angosto), plan B directo
+--      cuando no hay camino, y un presupuesto global de calculos por segundo
+--    · oido: disparos (con paredes que amortiguan), pasos de quien corre,
+--      balas que le pasan cerca, y "focos de combate" que se oyen de lejos
+--    · pelea: prioriza a quien le dispara, se cubre para recargar o si lo
+--      superan en numero, remata al debil, busca donde deberia estar el
+--      enemigo que perdio de vista, y los climas ya no lo paralizan
+--    · optimizado: filtros cacheados, menos red (cuello / giro), LOD de
+--      decisiones lejos de jugadores reales
+--  Ajustes en Tac.AI (se pueden pisar desde BotConfig.AI).
+--
+--  PENDIENTE: killcam siguiendo al bot.
 --==========================================================================
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -95,6 +108,60 @@ end
 --  la seccion TACTICAS) para no sumar locals al script, que ya tiene muchos.
 local Tac = {}
 
+--  [IA v2] Ajustes de la IA nueva. Cualquier clave se puede pisar desde
+--  BotConfig.AI (por ejemplo AI = { MantleMaxHeight = 0 } apaga el trepar).
+Tac.AI = {
+	--  Caminos
+	PathBudget = 14,			-- calculos de camino por segundo entre TODOS los bots
+	PathBurst = 10,				-- cuantos se pueden gastar de golpe
+	PathOverdraw = 3,			-- extra que pueden pedir prestado los urgentes (pelea, cubrirse)
+	RepathMinMove = 6,			-- si el destino se movio menos que esto, no recalcula
+	TightAgent = true,			-- tercer intento con un agente angosto (pasillos, puertas chicas)
+	SmoothEvery = 0.25,			-- cada cuanto intenta saltarse puntos del camino (camino recto)
+	SmoothLookahead = 3,		-- cuantos puntos adelante mira
+	DirectRange = 80,			-- sin camino: va derecho si el destino esta a menos de esto
+	DirectTime = 6,				-- cuanto dura ese intento directo
+	--  Parkour
+	ParkourEvery = 0.1,
+	ProbeAhead = 2.8,			-- distancia a la que mira obstaculos delante
+	MantleMaxHeight = 6.5,		-- bordes hasta esta altura se trepan (0 = nunca)
+	GapMax = 8,					-- huecos hasta este largo se saltan (0 = nunca)
+	JumpCooldown = 0.55,
+	--  Oido
+	NoiseThrottle = 0.2,		-- un mismo tirador avisa como mucho cada tanto
+	WallMuffle = 0.55,			-- a traves de paredes el disparo se oye a esta fraccion
+	FootstepRange = 42,			-- pasos corriendo; caminando se oyen a ~45 % de esto
+	WhizRadius = 7,				-- una bala que pasa a menos de esto la "siente"
+	SuppressTime = 1.1,			-- tras una bala cerca apunta peor este rato
+	SuppressError = 1.6,		-- grados extra de error estando suprimido
+	HotspotRange = 480,			-- de tan lejos se oye un tiroteo
+	HotspotLife = 22,			-- segundos que tarda en "enfriarse" un foco de combate
+	HotspotMerge = 45,
+	HotspotChance = 0.85,		-- paseando, prob. de ir hacia el tiroteo que oye
+	QuietHunt = 12,				-- s sin oir nada antes de ir "a donde suele haber gente"
+	--  Pelea
+	AttackerPriority = 25,		-- cuanto prefiere a quien le acaba de disparar
+	OutnumberedHealth = 0.65,	-- con 2+ enemigos a la vista y menos vida que esto: cubrirse
+	ReloadCoverRange = 45,		-- recargando con un enemigo a menos de esto: buscar cobertura
+	PushChance = 0.55,			-- prob. de ir a rematar a un enemigo con poca vida
+	CombatJumpChance = 0.1,		-- salto al moverse de lado de cerca
+	CombatCrouchChance = 0.3,	-- agacharse un momento al plantarse a disparar
+	--  Climas
+	WeatherTolerance = 8,		-- s a la intemperie antes de buscar techo
+	FloodTolerance = 4,			-- s en el agua antes de buscar un lugar alto
+	WeatherPanicHealth = 0.45,	-- con menos vida que esto busca techo enseguida
+	WeatherFightRange = 70,		-- con un enemigo a menos de esto, pelea en vez de resguardarse
+	--  Rendimiento
+	LodDistance = 260,			-- sin jugadores reales a esta distancia piensa mas lento
+	LodFactor = 0.5,
+}
+if type(Config.AI) == "table" then
+	for key, value in pairs(Config.AI) do Tac.AI[key] = value end
+end
+Tac.noiseAt = setmetatable({}, { __mode = "k" })	-- [tirador] = ultimo aviso de ruido
+Tac.hotspots = {}									-- focos de combate { pos, at, heat }
+Tac.partCache = setmetatable({}, { __mode = "k" })	-- [personaje] = piezas del cuerpo
+
 --==========================================================================
 --  UTILIDADES
 --==========================================================================
@@ -143,9 +210,14 @@ local function currentPhase()
 	return phaseValue and phaseValue.Value or "Lobby"
 end
 
+--  [IA v2] Se consulta en cada par de participantes: cacheado medio segundo.
 local function isFFA()
+	local now = os.clock()
+	if Tac.ffaAt and now - Tac.ffaAt < 0.5 then return Tac.ffa end
 	local mode = roundState:FindFirstChild("WinningMode")
-	return mode ~= nil and mode.Value == "FFA"
+	Tac.ffa = mode ~= nil and mode.Value == "FFA"
+	Tac.ffaAt = now
+	return Tac.ffa
 end
 
 local function executionActive()
@@ -615,16 +687,28 @@ local function canSee(state, fromPos, entry)
 end
 
 local function describeTarget(participant, character, myPos)
-	local humanoid = character:FindFirstChildOfClass("Humanoid")
-	local root = character:FindFirstChild("HumanoidRootPart")
-	if not humanoid or not root or humanoid.Health <= 0 then return nil end
+	--  [IA v2] Cada bot describe a cada participante varias veces por
+	--  segundo: las piezas del cuerpo se buscan una vez por personaje.
+	local parts = Tac.partCache[character]
+	if not parts or not parts.root.Parent or not parts.humanoid.Parent or not parts.head.Parent then
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if not humanoid or not root then return nil end
+		local head = character:FindFirstChild("Head")
+		parts = { humanoid = humanoid, root = root, head = head,
+			torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso") or root }
+		--  Sin cabeza todavia (cargando): no se guarda, se vuelve a buscar.
+		Tac.partCache[character] = head and parts or nil
+	end
+	local humanoid, root = parts.humanoid, parts.root
+	if humanoid.Health <= 0 then return nil end
 	return {
 		participant = participant,
 		character = character,
 		humanoid = humanoid,
 		root = root,
-		head = character:FindFirstChild("Head"),
-		torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso") or root,
+		head = parts.head,
+		torso = parts.torso,
 		dist = (root.Position - myPos).Magnitude,
 		downed = (character:GetAttribute("DownedState") or "") ~= "",
 		shielded = character:FindFirstChildOfClass("ForceField") ~= nil,
@@ -632,6 +716,12 @@ local function describeTarget(participant, character, myPos)
 end
 
 local function gatherEnemies(state, maxDistance)
+	--  [IA v2] La lista completa (sin limite de distancia) la piden varias
+	--  tacticas en la misma vuelta de decisiones: se calcula una vez.
+	local full = maxDistance == math.huge
+	if full and state.allEnemiesTick == state.thinkTick and state.allEnemies then
+		return state.allEnemies
+	end
 	local list = {}
 	local me = state.bot
 	local myPos = state.root.Position
@@ -647,6 +737,10 @@ local function gatherEnemies(state, maxDistance)
 		end
 	end
 	table.sort(list, function(a, b) return a.dist < b.dist end)
+	if full then
+		state.allEnemies = list
+		state.allEnemiesTick = state.thinkTick
+	end
 	return list
 end
 
@@ -658,38 +752,49 @@ local function perceive(state, now, dt)
 	local look = flat(state.root.CFrame.LookVector)
 	look = look.Magnitude > 0.01 and look.Unit or Vector3.new(0, 0, -1)
 	local cosHalf = math.cos(math.rad(P.FOV / 2))
-	--  [fase 2] En Ejecucion los abatidos ya no se ignoran: se van a rematar
-	--  de cerca (decideMovement / updateFire se encargan de la distancia).
-	local noDowned = false
 	local currentChar = state.target and state.target.character
+	local AI = Tac.AI
+	--  [IA v2] Quien le acaba de pegar es la amenaza real.
+	local attacker = state.lastAttacker and now - (state.lastAttackerAt or -100) < 4 and state.lastAttacker or nil
+	local order = Tac.currentOrder and Tac.currentOrder(state, now)
 
+	local enemies = gatherEnemies(state, state.viewDistance or P.ViewDistance)
 	local best, bestScore = nil, nil
-	local checks = 0
-	for _, entry in ipairs(gatherEnemies(state, state.viewDistance or P.ViewDistance)) do
+	local checks, seen = 0, 0
+	for _, entry in ipairs(enemies) do
 		if checks >= 5 then break end
-		if not (noDowned and entry.downed) then
-			local toEnemy = flat(entry.root.Position - headPos)
-			local inCone = toEnemy.Magnitude < 0.5 or look:Dot(toEnemy.Unit) >= cosHalf
-			local isCurrent = entry.character == currentChar and (now - state.lastSeenAt) < 1.5
-			if inCone or isCurrent or entry.dist <= P.CloseAwareness then
-				checks += 1
-				if canSee(state, headPos, entry) then
-					local score = entry.dist
-					if isCurrent then score -= 30 end
-					--  [23/09 noche] Un abatido cerca se remata ya (antes quedaba
-					--  muy abajo en la lista y se le pasaba de lado).
-					if entry.downed then score += (entry.dist < 30 and 8 or 60) end
-					--  [24/09] El objetivo que marco el Lider del equipo va primero.
-					local order = Tac.currentOrder and Tac.currentOrder(state, now)
-					if order and order.focus == entry.participant then score -= order.focusBonus end
-					if entry.shielded then score += 45 end
-					if not best or score < bestScore then
-						best, bestScore = entry, score
-					end
+		local toEnemy = flat(entry.root.Position - headPos)
+		local inCone = toEnemy.Magnitude < 0.5 or look:Dot(toEnemy.Unit) >= cosHalf
+		local isCurrent = entry.character == currentChar and (now - state.lastSeenAt) < 1.5
+		--  [IA v2] El que le disparo se busca aunque este fuera del cono.
+		local isAttacker = attacker ~= nil and entry.participant == attacker
+		if inCone or isCurrent or isAttacker or entry.dist <= P.CloseAwareness then
+			checks += 1
+			if canSee(state, headPos, entry) then
+				seen += 1
+				local score = entry.dist
+				if isCurrent then score -= 30 end
+				if isAttacker then score -= AI.AttackerPriority end
+				--  [23/09 noche] Un abatido cerca se remata ya (antes quedaba
+				--  muy abajo en la lista y se le pasaba de lado).
+				if entry.downed then score += (entry.dist < 30 and 8 or 60) end
+				--  [24/09] El objetivo que marco el Lider del equipo va primero.
+				if order and order.focus == entry.participant then score -= order.focusBonus end
+				if entry.shielded then score += 45 end
+				--  [IA v2] Al que le queda poca vida, y al que le esta apuntando.
+				score -= (1 - entry.humanoid.Health / math.max(entry.humanoid.MaxHealth, 1)) * 15
+				local theirLook = entry.root.CFrame.LookVector
+				local toMe = state.root.Position - entry.root.Position
+				if entry.dist < 90 and toMe.Magnitude > 0.1 and theirLook:Dot(toMe.Unit) > 0.975 then
+					score -= 10
+				end
+				if not best or score < bestScore then
+					best, bestScore = entry, score
 				end
 			end
 		end
 	end
+	state.visibleCount = seen
 
 	if best then
 		local sameAsBefore = currentChar == best.character
@@ -716,11 +821,20 @@ local function perceive(state, now, dt)
 		state.visible = true
 		state.lastSeenAt = now
 		state.lastSeenPos = best.root.Position
+		state.lastSeenVel = flat(best.root.AssemblyLinearVelocity)
+		state.searchPos = nil
 		state.noise = nil
 		--  [tacticas] Aviso al equipo: "hay uno aqui".
 		if Tac.reportIntel then Tac.reportIntel(state, best, now) end
 	else
+		--  [IA v2] Lo acaba de perder de vista: adonde iba corriendo.
+		if state.visible and state.target and Tac.predictSearch then Tac.predictSearch(state, now) end
 		state.visible = false
+		--  [IA v2] Sin nadie a la vista, escucha pasos.
+		if Tac.listenFootsteps and now >= (state.nextFootstepAt or 0) then
+			state.nextFootstepAt = now + 0.3
+			Tac.listenFootsteps(state, now, enemies)
+		end
 		local target = state.target
 		if target then
 			local gone = not target.character.Parent or target.humanoid.Health <= 0
@@ -736,16 +850,40 @@ end
 --  Un disparo (o un golpe) que el bot escucha / siente.
 local function notifyNoise(position, source, strength)
 	local now = os.clock()
+	local AI = Tac.AI
+	--  [IA v2] Una rafaga son muchos disparos seguidos del mismo lugar: basta
+	--  con avisar cada NoiseThrottle segundos (ahorra CPU con muchos bots).
+	if source then
+		local last = Tac.noiseAt[source]
+		if last and now - last < AI.NoiseThrottle then return end
+		Tac.noiseAt[source] = now
+	end
+	--  Foco de combate: se oye de mucho mas lejos (ver Tac.pickHotspot).
+	if Tac.recordCombat then Tac.recordCombat(position, now) end
+	local range = Config.Perception.HearingRange * (strength or 1)
+	local ear = position + Vector3.new(0, 1.5, 0)
 	for _, state in pairs(brains) do
-		if isAlive(state) and state.bot ~= source and not state.visible then
+		if isAlive(state) and state.bot ~= source and not state.visible
+			and (not source or areEnemies(state.bot, source)) then
 			local distance = (state.root.Position - position).Magnitude
-			local range = Config.Perception.HearingRange * (strength or 1)
-			if distance <= range and (not source or areEnemies(state.bot, source)) then
-				local fuzz = math.clamp(distance * 0.12, 2, 25)
+			local heard = distance <= range
+			local muffled = false
+			--  [IA v2] De lejos, una pared en medio lo amortigua.
+			if heard and distance > range * AI.WallMuffle then
+				losParams.FilterDescendantsInstances = Tac.worldFilter()
+				local hit = workspace:Raycast(ear, state.head.Position - ear, losParams)
+				if hit and not isSeeThrough(hit.Instance) then
+					heard, muffled = false, true
+				end
+			end
+			if heard then
+				local fuzz = math.clamp(distance * 0.12, 2, 25) * (muffled and 1.5 or 1)
 				local offset = Vector3.new(state.rng:NextNumber(-1, 1), 0, state.rng:NextNumber(-1, 1)) * fuzz
 				state.noise = { pos = position + offset, at = now }
 				state.lookAt = position
 				state.lookUntil = now + state.rng:NextNumber(1.2, 2.2)
+				--  [IA v2] Lo que oye tambien lo sabe su equipo (menos fiable que verlo).
+				if Tac.shareHeard then Tac.shareHeard(state, state.noise.pos, now) end
 			end
 		end
 	end
@@ -1001,6 +1139,8 @@ local function fireShot(state, weapon, aimPart, now)
 		+ (selfMoving and aim.SelfMoveError or 0)
 		+ state.recoil * cfg.RecoilDeg * (1 - aim.RecoilControl)
 		+ ((state.downed ~= "") and (Config.Downed and Config.Downed.ProneAimPenalty or 0) or 0)
+		--  [IA v2] Con balas pasandole cerca apunta peor (supresion).
+		+ ((state.suppressedUntil and now < state.suppressedUntil) and Tac.AI.SuppressError or 0)
 	local sigma = math.rad(errorDeg * 0.6)
 	local aimFrame = CFrame.lookAt(origin, origin + baseDir)
 		* CFrame.Angles(gaussian(rng) * sigma, gaussian(rng) * sigma, 0)
@@ -1018,6 +1158,7 @@ local function fireShot(state, weapon, aimPart, now)
 	local range = cfg.MaxRange * 1.4
 	local pelletSigma = math.rad((cfg.PelletSpread or 0) * 0.6)
 	local tracers = 0
+	local reach = nil
 	for _ = 1, info.pellets do
 		local frame = aimFrame
 		if pelletSigma > 0 then
@@ -1030,8 +1171,11 @@ local function fireShot(state, weapon, aimPart, now)
 		end
 		local result = castBullet(state, origin, direction, range)
 		if result then applyHit(state, weapon, result, origin) end
+		reach = reach or (result and (result.Position - origin).Magnitude or range)
 	end
 
+	--  [IA v2] Los bots enemigos por donde paso la bala la "sienten".
+	if Tac.bulletWhiz then Tac.bulletWhiz(state.bot, origin, aimFrame.LookVector, reach or range, now, Tac.AI.WhizRadius) end
 	notifyNoise(origin, state.bot, 1)
 end
 
@@ -1124,25 +1268,44 @@ end
 local function stopWalking(state)
 	state.waypoints = nil
 	state.moveMode = "hold"
+	state.directGoal = nil
+	state.detour = nil
 	state.humanoid:MoveTo(state.root.Position)
 	state.humanoid:Move(Vector3.zero)
 end
 
 local function requestPath(state, goal, kind)
 	if state.pathBusy then return end
+	local now = os.clock()
 	--  Un objetivo inalcanzable (arriba de un techo) no debe pedir 8 caminos
 	--  por segundo.
-	if os.clock() - state.lastRepath < 0.45 then return end
+	if now - state.lastRepath < 0.45 then return end
+	--  [IA v2] El destino casi no se movio y el camino actual sigue en pie:
+	--  se sigue usando (es lo que mas CPU ahorra con muchos bots).
+	if state.moveMode == "path" and state.waypoints and state.pathGoal and state.pathKind == kind
+		and (goal - state.pathGoal).Magnitude < Tac.AI.RepathMinMove then
+		state.lastRepath = now
+		return
+	end
+	--  [IA v2] Ya va derecho hacia ese mismo punto (plan B sin camino).
+	if state.moveMode == "direct" and state.directGoal and now < (state.directUntil or 0)
+		and (goal - state.directGoal).Magnitude < 8 then
+		return
+	end
+	--  [IA v2] Presupuesto global: si se acabo, se reintenta en la proxima vuelta.
+	if not Tac.takePathToken(kind) then return end
 	state.pathBusy = true
 	state.pathKind = kind
-	state.lastRepath = os.clock()
+	state.lastRepath = now
 	local startPos = state.root.Position
 	task.spawn(function()
-		local waypoints = nil
-		for _, path in ipairs({ state.path, state.pathJump }) do
+		local waypoints, usedPath = nil, nil
+		for attempt, path in ipairs(Tac.pathOrder(state, startPos, goal)) do
+			if attempt > 1 and not Tac.takePathToken(kind) then break end
 			local ok = pcall(function() path:ComputeAsync(startPos, goal) end)
 			if ok and path.Status == Enum.PathStatus.Success then
 				waypoints = path:GetWaypoints()
+				usedPath = path
 				break
 			end
 		end
@@ -1150,15 +1313,26 @@ local function requestPath(state, goal, kind)
 		if not isAlive(state) then return end
 		if waypoints and #waypoints >= 2 then
 			state.waypoints = waypoints
+			state.activePath = usedPath
 			state.wpIndex = 2
+			--  [IA v2] Mientras se calculaba siguio caminando: no volver atras
+			--  a puntos que ya paso.
+			local here = state.root.Position
+			while state.wpIndex < #waypoints and flat(waypoints[state.wpIndex].Position - here).Magnitude < 3 do
+				state.wpIndex += 1
+			end
 			state.moveMode = "path"
 			state.pathGoal = goal
 			state.pathFails = 0
 			state.lastMoveTarget = nil
+			state.directGoal = nil
+			state.detour = nil
 		else
 			state.pathFails += 1
 			state.waypoints = nil
 			state.pathGoal = nil
+			--  [IA v2] Sin camino: si esta cerca, va derecho y el parkour resuelve.
+			if Tac.directFallback then Tac.directFallback(state, goal) end
 		end
 	end)
 end
@@ -1191,6 +1365,8 @@ local function startStrafe(state, now, direction, duration)
 		end
 	end
 	state.waypoints = nil
+	state.directGoal = nil
+	state.detour = nil
 	state.humanoid:MoveTo(state.root.Position)
 	state.moveMode = "strafe"
 	state.strafeDir = dir
@@ -1199,7 +1375,28 @@ end
 
 local function stepMovement(state, now)
 	local humanoid, root = state.humanoid, state.root
+	--  [IA v2] Un desvio corto (esquivar a alguien, rodear una pared) manda
+	--  sobre el camino un momento.
+	local detour = state.detour
+	if detour then
+		if now < detour.untilT and (state.moveMode == "path" or state.moveMode == "direct") then
+			if state.lastMoveTarget ~= detour.pos then
+				humanoid:MoveTo(detour.pos)
+				state.lastMoveTarget = detour.pos
+				state.lastMoveToAt = now
+			end
+			return
+		end
+		state.detour = nil
+		state.lastMoveTarget = nil
+		if state.moveMode == "direct" and state.directGoal then
+			humanoid:MoveTo(state.directGoal)
+			state.lastMoveToAt = now
+		end
+	end
 	if state.moveMode == "path" and state.waypoints then
+		--  [IA v2] Camino recto: se salta puntos cuando hay paso libre.
+		if Tac.smoothPath then Tac.smoothPath(state, now) end
 		local waypoint = state.waypoints[state.wpIndex]
 		if waypoint then
 			local delta = waypoint.Position - root.Position
@@ -1220,9 +1417,13 @@ local function stepMovement(state, now)
 			return
 		end
 		--  [fase 3] Con ventarron a la intemperie, saltar te manda a volar.
+		--  [IA v2] Salta al llegar al punto de salto, no desde lejos (antes
+		--  iba saltando todo el tramo). Los bordes altos los trepa el parkour.
 		if waypoint.Action == Enum.PathWaypointAction.Jump and humanoid.FloorMaterial ~= Enum.Material.Air
-			and not state.galeExposed then
+			and not state.galeExposed and now >= (state.nextJumpAt or 0)
+			and flat(waypoint.Position - root.Position).Magnitude < 4.5 then
 			humanoid.Jump = true
+			state.nextJumpAt = now + Tac.AI.JumpCooldown
 		end
 		if state.lastMoveTarget ~= waypoint.Position or now - state.lastMoveToAt > 1.5 then
 			humanoid:MoveTo(waypoint.Position)
@@ -1230,6 +1431,22 @@ local function stepMovement(state, now)
 			--  para volver si se atora en un hueco.
 			if state.lastMoveTarget then state.safePos = state.lastMoveTarget end
 			state.lastMoveTarget = waypoint.Position
+			state.lastMoveToAt = now
+		end
+	elseif state.moveMode == "direct" and state.directGoal then
+		--  [IA v2] Plan B sin camino: derecho al destino.
+		local goal = state.directGoal
+		if (humanoid.WalkToPoint - goal).Magnitude > 1 then
+			--  Otra parte del cerebro ya lo mando a otro lado.
+			state.directGoal = nil
+		elseif now > (state.directUntil or 0)
+			or (flat(goal - root.Position).Magnitude < 2.5 and math.abs(goal.Y - root.Position.Y) < 5) then
+			state.directGoal = nil
+			state.moveMode = "hold"
+			state.arrivedAt = now
+			humanoid:MoveTo(root.Position)
+		elseif now - state.lastMoveToAt > 2 then
+			humanoid:MoveTo(goal)
 			state.lastMoveToAt = now
 		end
 	elseif state.moveMode == "strafe" then
@@ -1280,7 +1497,7 @@ end
 local function checkStuck(state, now)
 	checkWedged(state, now)
 	local M = Config.Movement
-	local moving = state.moveMode == "path" or state.moveMode == "strafe"
+	local moving = state.moveMode == "path" or state.moveMode == "strafe" or state.moveMode == "direct"
 	if not moving or (state.root.Position - state.progressPos).Magnitude > 1.5 then
 		state.progressPos = state.root.Position
 		state.progressAt = now
@@ -1291,6 +1508,9 @@ local function checkStuck(state, now)
 		state.progressAt = now
 		state.pathFails += 1
 		state.nextRoamAt = now
+		--  [IA v2] El proximo camino se prueba primero con saltos y angosto.
+		state.preferJumpUntil = now + 10
+		state.preferTightUntil = now + 10
 		local side = state.root.CFrame.RightVector * (state.rng:NextNumber() < 0.5 and -1 or 1)
 		startStrafe(state, now, side, 0.8)
 	elseif stuckFor > M.StuckJump and Tac.tryNearbyDoor and Tac.tryNearbyDoor(state, now) then
@@ -1305,8 +1525,21 @@ end
 local function pickRoamGoal(state)
 	local M = Config.Movement
 	local rng = state.rng
+	local now = os.clock()
+	--  [IA v2] Primero, hacia el tiroteo que se oye (como un jugador que va
+	--  "a donde suenan los tiros"), con un error que crece con la distancia.
+	if Tac.pickHotspot and rng:NextNumber() < Tac.AI.HotspotChance then
+		local spot = Tac.pickHotspot(state, now)
+		if spot then
+			local fuzz = math.clamp((spot.pos - state.root.Position).Magnitude * 0.06, 4, 30)
+			return spot.pos + Vector3.new(rng:NextNumber(-1, 1), 0, rng:NextNumber(-1, 1)) * fuzz
+		end
+	end
 	local huntBias = (state.meta.role and state.meta.role.HuntBias) or M.HuntBias
-	if rng:NextNumber() < huntBias then
+	--  [IA v2] "Saber" por donde anda la gente solo si hace rato que no se
+	--  oye nada: con tiros sonando, se guia por el oido.
+	local quiet = now - (Tac.lastCombatAt or -100) > Tac.AI.QuietHunt
+	if quiet and rng:NextNumber() < huntBias then
 		--  Un jugador sabe mas o menos por donde anda la gente: va hacia la
 		--  zona de un enemigo, con error.
 		local enemies = gatherEnemies(state, math.huge)
@@ -1497,6 +1730,10 @@ local function findDownedTeammate(state)
 	if not R or not R.Enabled or isFFA() then return nil end
 	local myTeam = teamOf(state.bot)
 	if not myTeam or myTeam == "Neutral" or myTeam == "Lobby" then return nil end
+	--  [IA v2] Casi siempre no hay nadie en el suelo: esa respuesta se
+	--  recuerda medio segundo en vez de recorrer a todos en cada vuelta.
+	local clock = os.clock()
+	if state.noDownedUntil and clock < state.noDownedUntil then return nil end
 	local best, bestDist = nil, math.huge
 	for _, participant in ipairs(Registry.participants()) do
 		if participant ~= state.bot and participant:GetAttribute("InRound") == true
@@ -1514,6 +1751,7 @@ local function findDownedTeammate(state)
 			end
 		end
 	end
+	if not best then state.noDownedUntil = clock + 0.5 end
 	return best, bestDist
 end
 
@@ -1573,7 +1811,7 @@ local function decideMovement(state, now)
 	--  pelear (salvo que tenga a un enemigo encima). Levanta disparando.
 	if state.meta.role and state.meta.role.Kind == "Apoyo" then
 		local enemyOnTop = target and state.visible
-			and (target.root.Position - state.root.Position).Magnitude < (Config.Revive.AbortClose or 18)
+			and (target.root.Position - state.root.Position).Magnitude < ((Config.Revive and Config.Revive.AbortClose) or 18)
 		if not enemyOnTop and Tac.seekRevive(state, now) then return end
 	end
 
@@ -1646,7 +1884,10 @@ local function decideMovement(state, now)
 		--  persigue: se queda y dispara desde ahi.
 		--  [23/09 noche] Con clima peligroso y a resguardo, no sale a buscarlo:
 		--  le dispara desde donde esta.
+		--  [IA v2] Solo si ya esta herido: sano, pelea como siempre.
+		local healthFrac = humanoid.Health / math.max(humanoid.MaxHealth, 1)
 		if not reloading and dist <= cfg.MaxRange and Tac.hazards(now)
+			and healthFrac < Tac.AI.WeatherPanicHealth
 			and not state.skyExposed and not state.inWater
 			and not (state.noShelterUntil and now < state.noShelterUntil) then
 			if state.moveMode ~= "hold" then stopWalking(state) end
@@ -1663,7 +1904,29 @@ local function decideMovement(state, now)
 			return
 		end
 
+		--  [IA v2] Enemigo debil (poca vida, o un bot recargando): a rematarlo.
+		local targetBrain = brains[target.participant]
+		local targetWeak = target.humanoid.Health / math.max(target.humanoid.MaxHealth, 1) < 0.35
+			or (targetBrain ~= nil and targetBrain.reload ~= nil)
+		if targetWeak and not reloading and healthFrac > 0.5 and dist > 10 then
+			if not state.pushDecidedFor or state.pushDecidedFor ~= target.character or now > (state.pushUntil or 0) then
+				state.pushDecidedFor = target.character
+				state.pushUntil = now + 2.5
+				state.pushing = state.rng:NextNumber() < Tac.AI.PushChance
+			end
+			if state.pushing then
+				humanoid.WalkSpeed = RUN_SPEED
+				requestPath(state, target.root.Position, "chase")
+				return
+			end
+		end
+
 		if reloading and dist < 60 then
+			--  [IA v2] Recargando con alguien cerca: primero, una cobertura
+			--  cerca para recargar tranquilo (Tac.updateCover la maneja).
+			if dist < Tac.AI.ReloadCoverRange and Tac.tryReloadCover and Tac.tryReloadCover(state, now, target) then
+				return
+			end
 			--  Recargando con alguien cerca: se aleja de lado/atras.
 			if state.moveMode ~= "strafe" or now >= state.strafeUntil then
 				local away = flat(state.root.Position - target.root.Position)
@@ -1688,10 +1951,23 @@ local function decideMovement(state, now)
 			--  En su rango: se mueve de lado o se planta, segun el preset.
 			state.nextDecisionAt = now + rangeNumber(state.rng, M.StrafeTime)
 			if state.rng:NextNumber() < state.aim.StrafeChance + ((state.meta.role and state.meta.role.StrafeBonus) or 0) then
-				local side = state.root.CFrame.RightVector * (state.rng:NextNumber() < 0.5 and -1 or 1)
-				startStrafe(state, now, side)
+				--  [IA v2] ADAD como un jugador: si ya iba de lado, cambia de lado.
+				local sign = state.rng:NextNumber() < 0.5 and -1 or 1
+				if state.moveMode == "strafe" and state.strafeDir then
+					sign = state.strafeDir:Dot(state.root.CFrame.RightVector) > 0 and -1 or 1
+				end
+				startStrafe(state, now, state.root.CFrame.RightVector * sign)
+				--  [IA v2] De cerca, a veces salta mientras se mueve de lado.
+				if dist < 30 and not state.galeExposed and state.rng:NextNumber() < Tac.AI.CombatJumpChance
+					and humanoid.FloorMaterial ~= Enum.Material.Air then
+					humanoid.Jump = true
+				end
 			else
 				stopWalking(state)
+				--  [IA v2] Plantado a disparar: a veces se agacha un momento.
+				if state.rng:NextNumber() < Tac.AI.CombatCrouchChance then
+					state.crouchUntil = now + state.rng:NextNumber(0.7, 1.6)
+				end
 			end
 		end
 		return
@@ -1709,29 +1985,52 @@ local function decideMovement(state, now)
 
 	if target and state.lastSeenPos then
 		--  Lo perdio de vista: va a donde lo vio por ultima vez.
-		humanoid.WalkSpeed = WALK_SPEED
-		local distToLast = flat(state.lastSeenPos - state.root.Position).Magnitude
+		--  [IA v2] ...o a donde iba corriendo (Tac.predictSearch), apuntando
+		--  hacia alla mientras se acerca, como alguien que "pre-apunta".
+		local goal = state.searchPos or state.lastSeenPos
+		local distToLast = flat(goal - state.root.Position).Magnitude
+		humanoid.WalkSpeed = distToLast > 40 and RUN_SPEED or WALK_SPEED
 		if distToLast < M.ArriveDistance + 1 or state.pathFails >= 3 then
 			state.target = nil
 			state.pathFails = 0
-			state.lookAt = state.root.Position + state.root.CFrame.RightVector * (state.rng:NextNumber() < 0.5 and -20 or 20)
-			state.lookUntil = now + 1.2
+			--  Mira hacia donde se fue; si no se sabe, a un costado.
+			local vel = state.lastSeenVel
+			if vel and vel.Magnitude > 2 then
+				state.lookAt = goal + vel.Unit * 25
+			else
+				state.lookAt = state.root.Position + state.root.CFrame.RightVector * (state.rng:NextNumber() < 0.5 and -20 or 20)
+			end
+			state.lookUntil = now + 1.4
+			state.searchPos = nil
 			stopWalking(state)
-		elseif state.pathKind ~= "search" or (not state.waypoints and not state.pathBusy) or now - state.lastRepath > M.RepathMoving * 2 then
-			requestPath(state, Tac.weatherGoal(state, state.lastSeenPos, now), "search")
+		else
+			if distToLast < 45 then
+				state.lookAt = goal + Vector3.new(0, 2, 0)
+				state.lookUntil = now + 0.5
+			end
+			if state.pathKind ~= "search" or (not state.waypoints and not state.pathBusy) or now - state.lastRepath > M.RepathMoving * 2 then
+				requestPath(state, Tac.weatherGoal(state, goal, now, true), "search")
+			end
 		end
 		return
 	end
 
 	if state.noise and now - state.noise.at < 8 then
 		--  Escucho algo: va a ver.
-		humanoid.WalkSpeed = WALK_SPEED
 		local distToNoise = flat(state.noise.pos - state.root.Position).Magnitude
+		--  [IA v2] De lejos corre; cerca camina apuntando hacia el ruido.
+		humanoid.WalkSpeed = distToNoise > 45 and RUN_SPEED or WALK_SPEED
 		if distToNoise < M.ArriveDistance + 2 or state.pathFails >= 3 then
 			state.noise = nil
 			state.pathFails = 0
-		elseif state.pathKind ~= "noise" or (not state.waypoints and not state.pathBusy) then
-			requestPath(state, Tac.weatherGoal(state, state.noise.pos, now), "noise")
+		else
+			if distToNoise < 45 then
+				state.lookAt = state.noise.pos + Vector3.new(0, 2, 0)
+				state.lookUntil = now + 0.5
+			end
+			if state.pathKind ~= "noise" or (not state.waypoints and not state.pathBusy) then
+				requestPath(state, Tac.weatherGoal(state, state.noise.pos, now, true), "noise")
+			end
 		end
 		return
 	end
@@ -1740,6 +2039,7 @@ local function decideMovement(state, now)
 	--  Paseando / buscando pelea.
 	humanoid.WalkSpeed = state.roamRun and RUN_SPEED or WALK_SPEED
 	local idle = not state.waypoints and not state.pathBusy and state.moveMode ~= "strafe"
+		and not (state.moveMode == "direct" and state.directGoal)		-- [IA v2] yendo derecho (plan B)
 	if (idle and now >= state.nextRoamAt) or (state.pathKind == "roam" and state.waypoints and now - state.lastRepath > M.RepathRoam * 3) then
 		state.nextRoamAt = now + state.rng:NextNumber(0.3, 1.5)
 		state.roamRun = state.rng:NextNumber() < ((state.meta.role and state.meta.role.RunChance) or 0.7)
@@ -1756,6 +2056,8 @@ local function decideMovement(state, now)
 end
 
 local function think(state, now, dt)
+	state.thinkTick += 1
+	if Tac.updateLod then Tac.updateLod(state, now) end		-- [IA v2] piensa mas lento lejos de jugadores
 	perceive(state, now, dt)
 
 	--  Arma
@@ -1810,16 +2112,22 @@ local function updateFacing(state, now, dt)
 		facePos = state.lookAt
 	end
 
+	--  [IA v2] Cada propiedad que se cambia viaja por red a todos los
+	--  clientes: solo se escribe cuando de verdad cambio.
 	if facePos then
 		local dir = flat(facePos - root.Position)
 		if dir.Magnitude > 0.3 then
-			state.align.CFrame = CFrame.lookAt(Vector3.zero, dir.Unit)
+			local unit = dir.Unit
+			if not state.alignDir or state.alignDir:Dot(unit) < 0.9998 then
+				state.align.CFrame = CFrame.lookAt(Vector3.zero, unit)
+				state.alignDir = unit
+			end
 		end
-		state.align.Enabled = true
-		humanoid.AutoRotate = false
+		if not state.align.Enabled then state.align.Enabled = true end
+		if humanoid.AutoRotate then humanoid.AutoRotate = false end
 	else
-		state.align.Enabled = false
-		humanoid.AutoRotate = true
+		if state.align.Enabled then state.align.Enabled = false end
+		if not humanoid.AutoRotate then humanoid.AutoRotate = true end
 	end
 
 	--  Cuello: el AnimBase (brazos + arma) va soldado a la cabeza, asi que
@@ -1833,7 +2141,10 @@ local function updateFacing(state, now, dt)
 		end
 		pitch = math.clamp(pitch, -1.1, 1.1)
 		state.pitch += (pitch - state.pitch) * math.min(1, dt * 12)
-		state.neck.C0 = state.neckBase * CFrame.Angles(state.pitch, 0, 0)
+		if not state.sentPitch or math.abs(state.pitch - state.sentPitch) > 0.01 then
+			state.neck.C0 = state.neckBase * CFrame.Angles(state.pitch, 0, 0)
+			state.sentPitch = state.pitch
+		end
 	end
 end
 
@@ -1844,9 +2155,11 @@ local function playAnimation(state, key, speed)
 		if track then track:Play(0.2) end
 		state.animTrack = track
 		state.animKey = key
+		state.animSpeed = nil
 	end
-	if state.animTrack and speed then
+	if state.animTrack and speed and (not state.animSpeed or math.abs(speed - state.animSpeed) > 0.08) then
 		state.animTrack:AdjustSpeed(speed)
+		state.animSpeed = speed
 	end
 end
 
@@ -1854,7 +2167,10 @@ local function updateAnimation(state)
 	local S = Enum.HumanoidStateType
 	local humanoidState = state.humanoid:GetState()
 	local speed = flat(state.root.AssemblyLinearVelocity).Magnitude
-	if humanoidState == S.Freefall then
+	--  [IA v2] Trepando un borde (parkour): animacion de trepar.
+	if state.climbAnimUntil and os.clock() < state.climbAnimUntil then
+		playAnimation(state, "climb", 1.6)
+	elseif humanoidState == S.Freefall then
 		playAnimation(state, "fall")
 	elseif humanoidState == S.Jumping then
 		playAnimation(state, "jump")
@@ -2130,6 +2446,7 @@ end
 local function thinkDowned(state, now, dt)
 	local D = Config.Downed or {}
 	if state.downed == "Ragdoll" then return end
+	state.thinkTick += 1
 	perceive(state, now, dt)
 
 	--  Arrastrandose (ya sin intentos): saca la pistola y pelea desde ahi.
@@ -2212,20 +2529,34 @@ end
 
 --  El mundo sin personajes ni las balas de ACS (para buscar cobertura,
 --  puestos y angulos).
+--  [IA v2] Se pedia cientos de veces por segundo (armando la lista cada
+--  vez): ahora se arma como mucho cada 0.15 s y se comparte. NO modificar
+--  la tabla que devuelve (usar table.clone si hace falta agregarle cosas).
+--  Tambien quita los cadaveres (workspace.Cuerpos): no son paredes.
 function Tac.worldFilter()
+	local now = os.clock()
+	if Tac.filterCache and now - Tac.filterAt < 0.15 then return Tac.filterCache end
 	local filter = { ACS_Workspace }
 	for _, participant in ipairs(Registry.participants()) do
 		local character = participant.Character
 		if character then table.insert(filter, character) end
 	end
+	local corpses = workspace:FindFirstChild("Cuerpos")
+	if corpses then table.insert(filter, corpses) end
+	Tac.filterCache, Tac.filterAt = filter, now
 	return filter
 end
 
 --  [23/09 noche] Con clima peligroso, un destino a la intemperie / en el
 --  agua se cambia por uno seguro cerca de el (se recuerda mientras el
 --  destino no cambie). Si no hay ninguno, se queda donde esta.
-function Tac.weatherGoal(state, goal, now)
+--  [IA v2] urgent = va a pelear (ruido, persecucion, avisos): ahi el clima
+--  no le cambia el destino, salvo que ya este herido.
+function Tac.weatherGoal(state, goal, now, urgent)
 	if not goal or not Tac.hazards(now) then return goal end
+	if urgent and state.humanoid.Health / math.max(state.humanoid.MaxHealth, 1) >= Tac.AI.WeatherPanicHealth then
+		return goal
+	end
 	--  No hay donde resguardarse cerca: juega normal.
 	if state.noShelterUntil and now < state.noShelterUntil then return goal end
 	if state.weatherGoalFrom and (state.weatherGoalFrom - goal).Magnitude < 4 then
@@ -2237,13 +2568,533 @@ function Tac.weatherGoal(state, goal, now)
 	return adjusted
 end
 
+--  [IA v2] Destinos "de pelea": el clima no los cambia y, si se acabo el
+--  presupuesto de caminos, pueden pedir prestado.
+Tac.combatKinds = {
+	chase = true, search = true, noise = true, intel = true, support = true, order = true,
+	sneak = true, flee = true, cover = true, revive = true, crawl = true, leadercover = true,
+}
+
 --  Ir a un punto, recalculando el camino cada 'every' segundos.
 function Tac.goTo(state, now, goal, kind, speed, every)
-	if kind ~= "safe" then goal = Tac.weatherGoal(state, goal, now) end
+	if kind ~= "safe" then goal = Tac.weatherGoal(state, goal, now, Tac.combatKinds[kind]) end
 	state.humanoid.WalkSpeed = speed
 	if state.pathKind ~= kind or (not state.waypoints and not state.pathBusy) or now - state.lastRepath > (every or 2) then
 		requestPath(state, goal, kind)
 	end
+end
+
+--==========================================================================
+--  IA v2: CAMINOS, PARKOUR, OIDO (25/09/2026)
+--==========================================================================
+--  Rayos del movimiento: ignoran piezas sin colision (zonas, triggers) y el
+--  agua (un charco no es piso para saltarse puntos del camino).
+Tac.moveParams = RaycastParams.new()
+Tac.moveParams.FilterType = Enum.RaycastFilterType.Exclude
+Tac.moveParams.IgnoreWater = true
+Tac.moveParams.RespectCanCollide = true
+--  Personajes delante (para esquivarlos).
+Tac.bumpParams = RaycastParams.new()
+Tac.bumpParams.FilterType = Enum.RaycastFilterType.Exclude
+Tac.bumpParams.IgnoreWater = true
+--  Techo encima (clima): aparte para no pisar el filtro de quien lo llama.
+Tac.shelterParams = RaycastParams.new()
+Tac.shelterParams.FilterType = Enum.RaycastFilterType.Exclude
+Tac.shelterParams.IgnoreWater = true
+
+--  Tercer agente: angosto, para pasillos y puertas chicas.
+Tac.tightAgent = { AgentRadius = 1.1, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = true,
+	WaypointSpacing = 4, Costs = { Water = 6 } }
+
+-- --------------------------------------------------------------------------
+--  Presupuesto de caminos (entre todos los bots). Se recarga en Heartbeat.
+-- --------------------------------------------------------------------------
+Tac.pathTokens = Tac.AI.PathBurst
+
+function Tac.takePathToken(kind)
+	local floor = Tac.combatKinds[kind] and (1 - Tac.AI.PathOverdraw) or 1
+	if Tac.pathTokens < floor then return false end
+	Tac.pathTokens -= 1
+	return true
+end
+
+--  En que orden probar los agentes. Si el destino esta mas alto (o se acaba
+--  de atorar) primero el que salta; si se atoro, primero el angosto.
+function Tac.pathOrder(state, startPos, goal)
+	local now = os.clock()
+	local list
+	if goal.Y - startPos.Y > 4 or (state.preferJumpUntil and now < state.preferJumpUntil) then
+		list = { state.pathJump, state.path }
+	else
+		list = { state.path, state.pathJump }
+	end
+	if Tac.AI.TightAgent then
+		state.pathTight = state.pathTight or PathfindingService:CreatePath(Tac.tightAgent)
+		if state.preferTightUntil and now < state.preferTightUntil then
+			table.insert(list, 1, state.pathTight)
+		else
+			table.insert(list, state.pathTight)
+		end
+	end
+	return list
+end
+
+--  Sin camino posible (pieza rara, navmesh roto, destino sobre algo): si
+--  esta cerca, va derecho; el parkour y el anti-atasco hacen el resto.
+function Tac.directFallback(state, goal)
+	local AI = Tac.AI
+	if state.moveMode == "strafe" then return end
+	--  Peleando, el movimiento lo decide el combate (salvo que fuera a perseguir).
+	if state.visible and state.pathKind ~= "chase" then return end
+	local delta = goal - state.root.Position
+	if flat(delta).Magnitude > AI.DirectRange or delta.Y > AI.MantleMaxHeight + 3 then return end
+	local now = os.clock()
+	state.waypoints = nil
+	state.moveMode = "direct"
+	state.directGoal = goal
+	state.directUntil = now + AI.DirectTime
+	state.detour = nil
+	state.lastMoveTarget = nil
+	state.humanoid:MoveTo(goal)
+	state.lastMoveToAt = now
+end
+
+--  A donde esta caminando ahora mismo.
+function Tac.moveGoal(state)
+	if state.detour then return state.detour.pos end
+	local mode = state.moveMode
+	if mode == "path" and state.waypoints then
+		local waypoint = state.waypoints[state.wpIndex]
+		return waypoint and waypoint.Position
+	elseif mode == "direct" then
+		return state.humanoid.WalkToPoint
+	elseif mode == "strafe" and state.strafeDir then
+		return state.root.Position + state.strafeDir * 6
+	end
+	return nil
+end
+
+--  Se puede ir caminando en linea recta de A a B: sin paredes (a lo ancho
+--  del cuerpo y a la altura de la cabeza) y con piso todo el tramo.
+function Tac.walkLineClear(fromPos, feetY, target, params)
+	local a = Vector3.new(fromPos.X, feetY + 1.4, fromPos.Z)
+	local b = Vector3.new(target.X, target.Y + 1.4, target.Z)
+	local delta = b - a
+	local length = delta.Magnitude
+	if length < 0.5 then return true end
+	local side = Vector3.new(-delta.Z, 0, delta.X)
+	if side.Magnitude < 0.01 then return false end
+	side = side.Unit * 0.9
+	if workspace:Raycast(a + side, delta, params) or workspace:Raycast(a - side, delta, params) then return false end
+	if workspace:Raycast(a + Vector3.new(0, 2.6, 0), delta, params) then return false end
+	local steps = math.clamp(math.floor(length / 4), 1, 4)
+	for i = 1, steps do
+		local point = a + delta * (i / (steps + 1))
+		local floor = workspace:Raycast(point, Vector3.new(0, -3.4, 0), params)
+		if not floor or floor.Normal.Y < 0.6 then return false end
+	end
+	return true
+end
+
+--  Camino recto: el navmesh da puntos cada 4-5 studs con curvas de mas
+--  (el tipico zigzag de NPC). Si hay paso libre a un punto mas adelante, se
+--  salta los del medio. Nunca se salta un punto de salto.
+function Tac.smoothPath(state, now)
+	local AI = Tac.AI
+	if now < (state.nextSmoothAt or 0) then return end
+	state.nextSmoothAt = now + AI.SmoothEvery
+	local waypoints, index = state.waypoints, state.wpIndex
+	if not waypoints or index >= #waypoints then return end
+	local humanoid, root = state.humanoid, state.root
+	if humanoid.FloorMaterial == Enum.Material.Air then return end
+	local WALK = Enum.PathWaypointAction.Walk
+	local limit = index
+	for i = index, math.min(index + AI.SmoothLookahead, #waypoints) do
+		if waypoints[i].Action ~= WALK then break end
+		limit = i
+	end
+	if limit <= index then return end
+	local feetY = root.Position.Y - humanoid.HipHeight - root.Size.Y * 0.5
+	local params = Tac.moveParams
+	params.FilterDescendantsInstances = Tac.worldFilter()
+	for skip = limit, index + 1, -1 do
+		local target = waypoints[skip].Position
+		if math.abs(target.Y - feetY) < 1.5 and Tac.walkLineClear(root.Position, feetY, target, params) then
+			state.wpIndex = skip
+			state.lastMoveTarget = nil
+			return
+		end
+	end
+end
+
+--  Otro personaje justo delante: un paso al costado (el lado contrario a el).
+function Tac.bumpCheck(state, now, dir)
+	if state.detour then return true end
+	local params = Tac.bumpParams
+	params.FilterDescendantsInstances = { state.character, ACS_Workspace }
+	local hit = workspace:Raycast(state.root.Position, dir * 3.2, params)
+	if not hit then return false end
+	local other = characterFromPart(hit.Instance)
+	if not other or other == state.character then return false end
+	--  Al que va a rematar / levantar (en el suelo) o a su objetivo no se lo esquiva.
+	if isDownedCharacter(other) or (state.target and state.target.character == other) then return false end
+	local otherRoot = other:FindFirstChild("HumanoidRootPart")
+	if not otherRoot then return false end
+	local perp = Vector3.new(-dir.Z, 0, dir.X)
+	local away = perp:Dot(otherRoot.Position - state.root.Position) > 0 and -perp or perp
+	state.detour = { pos = state.root.Position + away * 3.5 + dir * 2.5, untilT = now + 0.55 }
+	return true
+end
+
+--  Pared que no se puede trepar. De lado: cambia de lado. Yendo derecho
+--  (sin camino): prueba a rodearla. Con camino, el navmesh ya la rodea.
+function Tac.avoidWall(state, now, dir, base, params)
+	if state.moveMode == "strafe" then
+		if state.strafeDir and state.strafeDir:Dot(dir) > 0.5 then state.strafeDir = -state.strafeDir end
+		return
+	end
+	--  Solo en el plan B (directGoal): los "direct" de rematar / levantar /
+	--  clima son tramos cortos que ya apuntan a donde tienen que ir.
+	if state.moveMode ~= "direct" or not state.directGoal or state.detour then return end
+	groundParams.FilterDescendantsInstances = { state.character }
+	local from = base + Vector3.new(0, 1.2, 0)
+	for _, angle in ipairs({ 40, -40, 75, -75, 110, -110 }) do
+		local side = CFrame.Angles(0, math.rad(angle), 0):VectorToWorldSpace(dir)
+		if not workspace:Raycast(from, side * 6, params) then
+			local spot = state.root.Position + side * 6
+			if groundBelow(spot) then
+				state.detour = { pos = spot, untilT = now + 0.8 }
+				return
+			end
+		end
+	end
+end
+
+--  Trepar un borde (mantle): impulso justo para que el cuerpo pase por
+--  encima del borde; al pasarlo, Tac.parkour lo empuja hacia adelante.
+function Tac.startMantle(state, now, dir, topY, ledge)
+	local humanoid, root = state.humanoid, state.root
+	local rise = ledge - humanoid.HipHeight + 1.5
+	local vy = math.sqrt(2 * workspace.Gravity * math.max(rise, 1)) * 1.1
+	root.AssemblyLinearVelocity = dir * 1.5 + Vector3.new(0, vy, 0)
+	state.boost = { vy = vy, t0 = now }
+	state.mantle = { dir = dir, topY = topY, untilT = now + 0.9 }
+	state.nextMantleAt = now + 1.1
+	state.nextJumpAt = now + 0.6
+	state.climbAnimUntil = now + 0.45
+	dprint(state.bot.Name, string.format("trepa un borde de %.1f studs", ledge))
+end
+
+--  Un hueco delante (sin piso) y el destino sigue a su altura del otro lado:
+--  salta con el impulso justo para caer en el piso de enfrente.
+function Tac.tryLeap(state, now, dir, base, goal, params)
+	local AI = Tac.AI
+	local humanoid, root = state.humanoid, state.root
+	local feetY = base.Y
+	if workspace:Raycast(base + dir * 3 + Vector3.new(0, 1.5, 0), Vector3.new(0, -4.8, 0), params) then return end
+	--  Destino mas abajo: es una bajada a proposito (balcon, escalera rota).
+	if goal.Y < feetY - 3 or flat(goal - root.Position).Magnitude < 3 then return end
+	if now < (state.nextJumpAt or 0) then return end
+	for distance = 4.5, AI.GapMax + 1, 1.5 do
+		local spot = base + dir * distance
+		local land = workspace:Raycast(spot + Vector3.new(0, 4, 0), Vector3.new(0, -8, 0), params)
+		if land then
+			local rise = land.Position.Y - feetY
+			if land.Normal.Y < 0.6 or rise > 2.5 or rise < -2.5 then return end
+			if workspace:Raycast(base + Vector3.new(0, 3, 0), dir * (distance + 1), params) then return end
+			local speed = math.max(humanoid.WalkSpeed, RUN_SPEED)
+			local flight = (distance + 1.2) / speed
+			local vy = math.max(rise / flight + workspace.Gravity * flight * 0.5, humanoid.JumpPower)
+			humanoid.WalkSpeed = speed
+			root.AssemblyLinearVelocity = dir * speed + Vector3.new(0, vy, 0)
+			state.boost = { vy = vy, t0 = now }
+			state.nextJumpAt = now + 0.9
+			dprint(state.bot.Name, string.format("salta un hueco de %.1f studs", distance))
+			return
+		end
+	end
+end
+
+--  Cada frame (con limite ParkourEvery): obstaculos y huecos delante.
+function Tac.parkour(state, now)
+	local AI = Tac.AI
+	local humanoid, root = state.humanoid, state.root
+	--  Impulso recien dado (trepar / saltar un hueco): si el Humanoid lo
+	--  freno en el primer instante (se "pega" al piso), se repone.
+	local boost = state.boost
+	if boost then
+		local elapsed = now - boost.t0
+		if elapsed > 0.12 then
+			state.boost = nil
+		else
+			local expected = boost.vy - workspace.Gravity * elapsed
+			local velocity = root.AssemblyLinearVelocity
+			if expected > 0 and velocity.Y < expected * 0.7 then
+				root.AssemblyLinearVelocity = Vector3.new(velocity.X, expected, velocity.Z)
+			end
+		end
+	end
+	--  Trepando: en cuanto el cuerpo pasa el borde, adelante.
+	local mantle = state.mantle
+	if mantle then
+		if now > mantle.untilT then
+			state.mantle = nil
+		else
+			if root.Position.Y - root.Size.Y * 0.5 > mantle.topY + 0.2 then
+				local velocity = root.AssemblyLinearVelocity
+				root.AssemblyLinearVelocity = Vector3.new(mantle.dir.X * 14, math.max(velocity.Y, 2), mantle.dir.Z * 14)
+				state.mantle = nil
+			end
+			return
+		end
+	end
+	if now < (state.nextParkourAt or 0) then return end
+	state.nextParkourAt = now + AI.ParkourEvery
+	local mode = state.moveMode
+	local S = Enum.HumanoidStateType
+	local humanoidState = humanoid:GetState()
+	if (mode ~= "path" and mode ~= "direct" and mode ~= "strafe")
+		or state.downed ~= "" or state.slide or state.galeExposed
+		or humanoid.FloorMaterial == Enum.Material.Air
+		or humanoidState == S.Swimming or humanoidState == S.Climbing
+		or humanoidState == S.Jumping or humanoidState == S.Freefall then
+		state.slowSince = nil
+		return
+	end
+
+	local goal = Tac.moveGoal(state)
+	local dir = flat(humanoid.MoveDirection)
+	if dir.Magnitude < 0.3 and goal then dir = flat(goal - root.Position) end
+	if dir.Magnitude < 0.3 then return end
+	dir = dir.Unit
+
+	if (mode == "path" or state.directGoal) and Tac.bumpCheck(state, now, dir) then return end
+
+	local hip = humanoid.HipHeight
+	local feetY = root.Position.Y - hip - root.Size.Y * 0.5
+	local base = Vector3.new(root.Position.X, feetY, root.Position.Z)
+	local params = Tac.moveParams
+	params.FilterDescendantsInstances = Tac.worldFilter()
+	local ahead = dir * AI.ProbeAhead
+
+	--  Frenado de verdad (no un instante al arrancar).
+	if flat(root.AssemblyLinearVelocity).Magnitude < humanoid.WalkSpeed * 0.45 then
+		state.slowSince = state.slowSince or now
+	else
+		state.slowSince = nil
+	end
+	local blocked = state.slowSince ~= nil and now - state.slowSince > 0.35
+
+	local low = workspace:Raycast(base + Vector3.new(0, 0.9, 0), ahead, params)
+	if low and low.Normal.Y < 0.6 and not (Tac.doorParts and Tac.doorParts[low.Instance]) then
+		--  Con camino, solo si el camino sube por ahi o si lo esta frenando
+		--  (no se sube a cada caja que roza).
+		local pathWantsUp = goal ~= nil and goal.Y > feetY + hip * 0.8
+		if mode == "path" and not blocked and not pathWantsUp then return end
+
+		local jumpHeight = (humanoid.JumpPower ^ 2) / (2 * workspace.Gravity)
+		local canJump = hip + jumpHeight - 0.3
+		local maxUp = math.max(AI.MantleMaxHeight, canJump)
+		--  Altura del obstaculo: rayos hacia adelante cada vez mas altos hasta
+		--  que uno pasa libre (empezar desde arriba fallaba bajo techo).
+		local clearAt = nil
+		local height = 0.9
+		while height < maxUp + 0.8 do
+			height += 1.2
+			if not workspace:Raycast(base + Vector3.new(0, height, 0), ahead + dir * 0.8, params) then
+				clearAt = height
+				break
+			end
+		end
+		local ledge, topY = nil, nil
+		if clearAt then
+			local over = low.Position + dir * 0.2
+			local top = workspace:Raycast(Vector3.new(over.X, feetY + clearAt, over.Z), Vector3.new(0, -(clearAt + 0.2), 0), params)
+			if top and top.Normal.Y > 0.6 then
+				topY = top.Position.Y
+				ledge = topY - feetY
+				--  Sin lugar para pararse arriba (debajo de una mesa): no.
+				if workspace:Raycast(top.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, 4.8, 0), params) then
+					ledge = nil
+				end
+			end
+		end
+		if ledge and ledge <= hip * 0.8 then return end		-- el Humanoid lo sube solo
+		if ledge and ledge <= canJump then
+			if now >= (state.nextJumpAt or 0) then
+				humanoid.Jump = true
+				state.nextJumpAt = now + AI.JumpCooldown
+			end
+			return
+		end
+		if ledge and ledge <= AI.MantleMaxHeight and now >= (state.nextMantleAt or 0)
+			and (mode ~= "strafe" or blocked)
+			and not workspace:Raycast(root.Position, Vector3.new(0, ledge + 1, 0), params) then
+			Tac.startMantle(state, now, dir, topY, ledge)
+			return
+		end
+		Tac.avoidWall(state, now, dir, base, params)
+		return
+	end
+
+	if not low and mode ~= "strafe" and AI.GapMax > 0 and goal then
+		Tac.tryLeap(state, now, dir, base, goal, params)
+	end
+end
+
+-- --------------------------------------------------------------------------
+--  Oido: focos de combate, pasos, balas que pasan cerca
+-- --------------------------------------------------------------------------
+--  Cada disparo (bot o jugador) calienta un foco. Los focos se "oyen" desde
+--  muy lejos (HotspotRange) aunque el disparo individual no llegue al bot.
+function Tac.recordCombat(pos, now)
+	local AI = Tac.AI
+	Tac.lastCombatAt = now
+	local list = Tac.hotspots
+	for _, spot in ipairs(list) do
+		if (spot.pos - pos).Magnitude < AI.HotspotMerge then
+			spot.heat = math.min(spot.heat * math.exp(-(now - spot.at) / AI.HotspotLife) + 1, 40)
+			spot.pos = spot.pos:Lerp(pos, 0.25)
+			spot.at = now
+			return
+		end
+	end
+	if #list >= 24 then
+		local oldest = 1
+		for i, spot in ipairs(list) do
+			if spot.at < list[oldest].at then oldest = i end
+		end
+		table.remove(list, oldest)
+	end
+	table.insert(list, { pos = pos, at = now, heat = 1 })
+end
+
+--  El tiroteo que mas "suena" desde aca: caliente, reciente y no muy lejos.
+function Tac.pickHotspot(state, now)
+	local AI = Tac.AI
+	local myPos = state.root.Position
+	local list = Tac.hotspots
+	local best, bestScore = nil, nil
+	for i = #list, 1, -1 do
+		local spot = list[i]
+		local age = now - spot.at
+		if age > AI.HotspotLife * 2 then
+			table.remove(list, i)
+		else
+			local distance = (spot.pos - myPos).Magnitude
+			if distance > 30 and distance <= AI.HotspotRange then
+				local score = spot.heat * math.exp(-age / AI.HotspotLife) / (1 + distance / 120)
+				if not bestScore or score > bestScore then best, bestScore = spot, score end
+			end
+		end
+	end
+	return best
+end
+
+--  Lo que un bot oye lo sabe su equipo, pero un avistamiento reciente vale mas.
+function Tac.shareHeard(state, pos, now)
+	local team = Tac.teamKey(state)
+	if not team then return end
+	local current = Tac.intelByTeam[team]
+	if current and not current.heard and now - current.at < 3 then return end
+	Tac.intelByTeam[team] = { pos = pos, at = now, heard = true }
+end
+
+--  Pasos: el que corre se oye; el que camina, solo de cerca; agachado o
+--  quieto, nada.
+function Tac.listenFootsteps(state, now, enemies)
+	local AI = Tac.AI
+	if state.noise and now - state.noise.at < 1.5 then return end
+	for _, entry in ipairs(enemies) do
+		if entry.dist > AI.FootstepRange then break end
+		local speed = flat(entry.root.AssemblyLinearVelocity).Magnitude
+		local range = 0
+		if speed > 18 then
+			range = AI.FootstepRange
+		elseif speed > 7 and entry.character:GetAttribute("ACS_Stance") ~= 1 then
+			range = AI.FootstepRange * 0.45
+		end
+		if entry.dist <= range then
+			local fuzz = math.clamp(entry.dist * 0.1, 1.5, 6)
+			local offset = Vector3.new(state.rng:NextNumber(-1, 1), 0, state.rng:NextNumber(-1, 1)) * fuzz
+			state.noise = { pos = entry.root.Position + offset, at = now }
+			state.lookAt = state.noise.pos
+			state.lookUntil = now + state.rng:NextNumber(0.8, 1.5)
+			return
+		end
+	end
+end
+
+--  Una bala que le pasa cerca: sabe de donde vino y apunta peor un momento.
+function Tac.bulletWhiz(shooter, origin, dir, reach, now, radius)
+	local AI = Tac.AI
+	for _, other in pairs(brains) do
+		if other.bot ~= shooter and not other.dead and other.head and other.head.Parent
+			and areEnemies(other.bot, shooter) then
+			local rel = other.head.Position - origin
+			local along = rel:Dot(dir)
+			if along > 3 and along < reach + 2 and (rel - dir * along).Magnitude < radius then
+				other.suppressedUntil = now + AI.SuppressTime
+				if not other.visible then
+					other.noise = { pos = origin, at = now }
+					other.lookAt = origin
+					other.lookUntil = now + 1.6
+				end
+			end
+		end
+	end
+end
+
+--  Lo perdio de vista corriendo: lo busca un poco mas alla, en la direccion
+--  en que iba (sin atravesar paredes).
+function Tac.predictSearch(state, now)
+	local from, velocity = state.lastSeenPos, state.lastSeenVel
+	if not from or not velocity or velocity.Magnitude < 4 then
+		state.searchPos = nil
+		return
+	end
+	local guess = from + velocity * 1.2
+	local params = Tac.moveParams
+	params.FilterDescendantsInstances = Tac.worldFilter()
+	local up = Vector3.new(0, 1.5, 0)
+	local hit = workspace:Raycast(from + up, guess - from, params)
+	if hit then guess = hit.Position - (guess - from).Unit * 2 - up end
+	state.searchPos = guess
+end
+
+--  Recargando con un enemigo cerca: una cobertura a pocos pasos.
+function Tac.tryReloadCover(state, now, target)
+	if state.cover then return true end
+	if now < (state.nextReloadCoverAt or 0) then return false end
+	state.nextReloadCoverAt = now + 3
+	local spot = Tac.findCover(state, target.root.Position, 2)
+	if not spot or flat(spot - state.root.Position).Magnitude > 16 then return false end
+	state.cover = { pos = spot, threat = target.root.Position, arrived = false, untilT = now + 6, reason = "reload" }
+	state.hold, state.watch = nil, nil
+	dprint(state.bot.Name, "se cubre para recargar")
+	return Tac.updateCover(state, now)
+end
+
+--  Lejos de todo jugador real y sin pelea: piensa a menor ritmo (nadie lo
+--  esta mirando). Se reevalua cada segundo.
+function Tac.updateLod(state, now)
+	if now < (state.nextLodAt or 0) then return end
+	state.nextLodAt = now + 1
+	if state.target or (state.noise and now - state.noise.at < 8) then
+		state.lod = 1
+		return
+	end
+	local AI = Tac.AI
+	local pos = state.root.Position
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		local root = character and character:FindFirstChild("HumanoidRootPart")
+		if root and (root.Position - pos).Magnitude < AI.LodDistance then
+			state.lod = 1
+			return
+		end
+	end
+	state.lod = AI.LodFactor
 end
 
 -- --------------------------------------------------------------------------
@@ -2422,11 +3273,11 @@ end
 -- --------------------------------------------------------------------------
 --  Un punto cercano donde, agachado, el enemigo no lo ve. Prueba anillos de
 --  7, 14, 21 y 28 studs y se queda con el mas cercano que sirva.
-function Tac.findCover(state, threatPos)
+function Tac.findCover(state, threatPos, maxRing)
 	local origin = state.root.Position
 	local threatEye = threatPos + Vector3.new(0, 1.5, 0)
 	Tac.params.FilterDescendantsInstances = Tac.worldFilter()
-	for ring = 1, 4 do
+	for ring = 1, maxRing or 4 do
 		local radius = ring * 7
 		local best, bestScore = nil, nil
 		for i = 0, 11 do
@@ -2460,7 +3311,15 @@ function Tac.updateCover(state, now)
 	if cover then
 		local target = state.target
 		local enemyClose = target and state.visible and (target.root.Position - state.root.Position).Magnitude < 10
-		if now > cover.untilT or health >= (role.CoverHealth or 0.35) + 0.2 or enemyClose then
+		--  [IA v2] Cada motivo de cubrirse tiene su forma de terminar.
+		local recovered = health >= (role.CoverHealth or 0.35) + 0.2
+		if cover.reason == "reload" then
+			local weapon = state.weapons[state.current]
+			recovered = not state.reload and weapon ~= nil and weapon.mag >= weapon.info.magSize * 0.6
+		elseif cover.reason == "outnumbered" then
+			recovered = cover.arrived and now > (cover.minT or math.huge)
+		end
+		if now > cover.untilT or recovered or enemyClose then
 			state.cover = nil
 			state.nextCoverTry = now + 6
 			return false
@@ -2479,6 +3338,7 @@ function Tac.updateCover(state, now)
 		if not cover.arrived then
 			cover.arrived = true
 			cover.untilT = now + rangeNumber(state.rng, (Config.Cover and Config.Cover.StayTime) or { 8, 14 })
+			cover.minT = now + state.rng:NextNumber(2.5, 4.5)
 		end
 		if state.moveMode ~= "hold" then stopWalking(state) end
 		if not (target and state.visible) then
@@ -2493,7 +3353,10 @@ function Tac.updateCover(state, now)
 		return true
 	end
 
-	if health > (role.CoverHealth or 0.35) or now < (state.nextCoverTry or 0) then return false end
+	--  [IA v2] Tambien se cubre si lo superan en numero y ya esta tocado.
+	local lowHealth = health <= (role.CoverHealth or 0.35)
+	local outnumbered = (state.visibleCount or 0) >= 2 and health < Tac.AI.OutnumberedHealth
+	if not (lowHealth or outnumbered) or now < (state.nextCoverTry or 0) then return false end
 	local threat = nil
 	if state.target and state.visible then
 		threat = state.target.root.Position
@@ -2506,9 +3369,10 @@ function Tac.updateCover(state, now)
 	state.nextCoverTry = now + 3
 	local spot = Tac.findCover(state, threat)
 	if not spot then return false end
-	state.cover = { pos = spot, threat = threat, arrived = false, untilT = now + 12 }
+	state.cover = { pos = spot, threat = threat, arrived = false, untilT = now + 12,
+		reason = lowHealth and "health" or "outnumbered" }
 	state.hold, state.watch = nil, nil
-	dprint(state.bot.Name, "se va a cubrir")
+	dprint(state.bot.Name, lowHealth and "se va a cubrir" or "lo superan en numero: se cubre")
 	return true
 end
 
@@ -2517,6 +3381,7 @@ end
 -- --------------------------------------------------------------------------
 function Tac.wantsCrouch(state, now)
 	if state.cover and state.cover.arrived then return true end
+	if state.crouchUntil and now < state.crouchUntil then return true end		-- [IA v2] agacharse en pelea
 	--  [24/09] Levantando a alguien con peligro cerca: agachado.
 	if state.reviveFace and ((state.target and state.visible) or (state.lastDamageAt and now - state.lastDamageAt < 4)) then
 		return true
@@ -2920,10 +3785,12 @@ end
 --  altura del pecho no cuenta.)
 function Tac.isSheltered(point, fromHeight)
 	local from = point + Vector3.new(0, fromHeight or 4.8, 0)
-	local filter = Tac.worldFilter()
+	--  [IA v2] Copia (el filtro compartido no se toca) y rayos propios (no
+	--  pisa el filtro de Tac.params de quien la llama a mitad de un bucle).
+	local filter = table.clone(Tac.worldFilter())
 	for _ = 1, 8 do
-		Tac.params.FilterDescendantsInstances = filter
-		local result = workspace:Raycast(from, Vector3.new(0, 250, 0), Tac.params)
+		Tac.shelterParams.FilterDescendantsInstances = filter
+		local result = workspace:Raycast(from, Vector3.new(0, 250, 0), Tac.shelterParams)
 		if not result then return false end
 		local part = result.Instance
 		local ignorable = part ~= workspace.Terrain and (not part.CanCollide or part.Transparency >= 0.9
@@ -2982,13 +3849,14 @@ function Tac.findSafeSpot(state, needShelter, needDry, maxRadius, stepSize, dire
 	local rng = state.rng
 	local step = stepSize or 8
 	local dirs = directions or 12
+	--  [IA v2] Una vez, no en cada uno de los cientos de rayos.
+	Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
 	for ring = 1, math.max(1, math.ceil(maxRadius / step)) do
 		local radius = ring * step
 		local best, bestScore = nil, nil
 		for i = 0, dirs - 1 do
 			local angle = i * (math.pi * 2 / dirs) + rng:NextNumber(-0.25, 0.25)
 			for _, lift in ipairs({ 0, 14, 28 }) do
-				Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
 				local probe = origin + Vector3.new(math.cos(angle) * radius, 6 + lift, math.sin(angle) * radius)
 				local ground = workspace:Raycast(probe, Vector3.new(0, -(14 + lift), 0), Tac.probeParams)
 				if ground and ground.Normal.Y > 0.7 then
@@ -3026,9 +3894,18 @@ function Tac.weatherSafetyInner(state, now)
 		return false, "sin clima"
 	end
 	local W = Config.Weather or {}
+	local AI = Tac.AI
 	local target = state.target
-	if target and state.visible and (target.root.Position - state.root.Position).Magnitude < (W.FightFirst or 20) then
+	--  [IA v2] Con vida, la pelea va primero: un enemigo a la vista (hasta
+	--  WeatherFightRange), uno que acaba de perder de vista o un tiro que
+	--  acaba de oir. Herido, vuelve a la regla vieja (solo si lo tiene encima).
+	local healthy = state.humanoid.Health / math.max(state.humanoid.MaxHealth, 1) >= AI.WeatherPanicHealth
+	local fightRange = healthy and math.max(W.FightFirst or 0, AI.WeatherFightRange) or (W.FightFirst or 20)
+	if target and state.visible and (target.root.Position - state.root.Position).Magnitude < fightRange then
 		return false, "peleando cerca"
+	end
+	if healthy and ((target and now - state.lastSeenAt < 5) or (state.noise and now - state.noise.at < 4)) then
+		return false, "buscando pelea"
 	end
 	if now >= (state.nextHazardCheck or 0) then
 		state.nextHazardCheck = now + 0.5
@@ -3037,10 +3914,21 @@ function Tac.weatherSafetyInner(state, now)
 			or state.humanoid:GetState() == Enum.HumanoidStateType.Swimming or not Tac.isDry(feet)) or false
 		--  Desde su cabeza, igual que lo mide ClimaEspecialServer.
 		state.skyExposed = hazards.shelter and not Tac.isSheltered(state.head.Position, 0) or false
+		if state.inWater or state.skyExposed then
+			state.exposedSince = state.exposedSince or now
+		else
+			state.exposedSince = nil
+		end
 	end
 	if not state.inWater and not state.skyExposed then
 		state.safeGoal = nil
 		return false, "a resguardo"
+	end
+	--  [IA v2] Aguanta un rato a la intemperie (como un jugador que termina lo
+	--  que estaba haciendo) antes de ir a buscar techo.
+	local tolerance = state.inWater and AI.FloodTolerance or AI.WeatherTolerance
+	if healthy and not state.safeGoal and now - (state.exposedSince or now) < tolerance then
+		return false, "aguanta el clima"
 	end
 	local goal = state.safeGoal
 	if goal and (now > goal.untilT or state.pathFails >= 2) then
@@ -3138,6 +4026,9 @@ end
 --  Un puesto detras de su equipo (del lado contrario a los enemigos), con
 --  paredes cerca y, si se puede, donde no lo vean desde la zona enemiga.
 function Tac.findLeaderSpot(state, enemies)
+	--  [IA v2] Filtros una sola vez (antes se armaban en cada vuelta del bucle).
+	Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
+	Tac.params.FilterDescendantsInstances = Tac.worldFilter()
 	local L = Config.Leader or {}
 	local origin = state.root.Position
 	local enemyCenter = nil
@@ -3163,13 +4054,11 @@ function Tac.findLeaderSpot(state, enemies)
 	for _ = 1, 16 do
 		local angle = rng:NextNumber(0, math.pi * 2)
 		local radius = rng:NextNumber(0, 22)
-		Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
 		local probe = Vector3.new(base.X + math.cos(angle) * radius, math.max(base.Y, origin.Y) + 8, base.Z + math.sin(angle) * radius)
 		local ground = workspace:Raycast(probe, Vector3.new(0, -26, 0), Tac.probeParams)
 		if ground and ground.Normal.Y > 0.7 and Tac.climateOk(ground.Position) then
 			local spot = ground.Position
 			local eye = spot + Vector3.new(0, 2.4, 0)
-			Tac.params.FilterDescendantsInstances = Tac.worldFilter()
 			local walls = 0
 			for k = 0, 7 do
 				local a = k * math.pi / 4
@@ -3658,6 +4547,9 @@ end
 --  Un punto ALTO (azotea, balcon, piso de arriba) con vista hacia los
 --  enemigos y a distancia de tiro de su arma principal.
 function Tac.findPerch(state)
+	--  [IA v2] Filtros una sola vez (antes se armaban en cada vuelta del bucle).
+	Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
+	Tac.params.FilterDescendantsInstances = Tac.worldFilter()
 	local role = state.meta.role
 	local origin = state.root.Position
 	local rng = state.rng
@@ -3675,14 +4567,12 @@ function Tac.findPerch(state)
 		local angle = rng:NextNumber(0, math.pi * 2)
 		local radius = rng:NextNumber(10, role.PerchSearch or 110)
 		local lift = lifts[(i % #lifts) + 1]
-		Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
 		local probe = Vector3.new(origin.X + math.cos(angle) * radius, origin.Y + lift, origin.Z + math.sin(angle) * radius)
 		local ground = workspace:Raycast(probe, Vector3.new(0, -(lift + 20), 0), Tac.probeParams)
 		if ground and ground.Normal.Y > 0.7 and not isSeeThrough(ground.Instance) then
 			local spot = ground.Position
 			local height = spot.Y - refY
 			if height >= (role.MinHeight or 6) and not Tac.isBadPerch(state, spot) and Tac.climateOk(spot) then
-				Tac.params.FilterDescendantsInstances = Tac.worldFilter()
 				--  Que quepa una persona (nada justo encima).
 				if not workspace:Raycast(spot + Vector3.new(0, 0.5, 0), Vector3.new(0, 5, 0), Tac.params) then
 					local eye = spot + Vector3.new(0, 2.6, 0)
@@ -3713,6 +4603,9 @@ end
 --  angosto) y un punto adentro, a 10-16 studs, desde donde se la ve. Elige
 --  el lado contrario a los enemigos: ellos tienen que entrar por ahi.
 function Tac.findChokeHold(state)
+	--  [IA v2] Filtros una sola vez (antes se armaban en cada vuelta del bucle).
+	Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
+	Tac.params.FilterDescendantsInstances = Tac.worldFilter()
 	local origin = state.root.Position
 	local rng = state.rng
 	local enemyCenter = Tac.enemyCenter(state)
@@ -3732,11 +4625,9 @@ function Tac.findChokeHold(state)
 	for _ = 1, 20 do
 		local angle = rng:NextNumber(0, math.pi * 2)
 		local radius = rng:NextNumber(8, 60)
-		Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
 		local ground = workspace:Raycast(origin + Vector3.new(math.cos(angle) * radius, 5, math.sin(angle) * radius), Vector3.new(0, -14, 0), Tac.probeParams)
 		if ground and ground.Normal.Y > 0.7 then
 			local p = ground.Position + Vector3.new(0, 2.5, 0)
-			Tac.params.FilterDescendantsInstances = Tac.worldFilter()
 			for _, axis in ipairs({ Vector3.new(1, 0, 0), Vector3.new(0, 0, 1) }) do
 				if workspace:Raycast(p, axis * 5, Tac.params) and workspace:Raycast(p, -axis * 5, Tac.params) then
 					local along = Vector3.new(-axis.Z, 0, axis.X)
@@ -3750,14 +4641,12 @@ function Tac.findChokeHold(state)
 	local list = {}
 	for _, candidate in ipairs(candidates) do
 		for _, dir in ipairs(candidate.dirs) do
-			Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
 			local probe = candidate.entry + dir * rng:NextNumber(10, 16) + Vector3.new(0, 5, 0)
 			local ground = workspace:Raycast(probe, Vector3.new(0, -14, 0), Tac.probeParams)
 			if ground and ground.Normal.Y > 0.7 and not Tac.isBadPerch(state, ground.Position) and Tac.climateOk(ground.Position) then
 				local spot = ground.Position
 				local eye = spot + Vector3.new(0, 2.6, 0)
 				local toEntry = (candidate.entry + Vector3.new(0, 2.5, 0)) - eye
-				Tac.params.FilterDescendantsInstances = Tac.worldFilter()
 				local hit = workspace:Raycast(eye, toEntry, Tac.params)
 				if not hit or (hit.Position - eye).Magnitude > toEntry.Magnitude * 0.85 then
 					local score = -(spot - origin).Magnitude * 0.1
@@ -3806,8 +4695,16 @@ function Tac.camp(state, now)
 		--  candidatos en orden y se queda con el primero alcanzable.
 		state.perchSearching = true
 		task.spawn(function()
-			local path = PathfindingService:CreatePath({ AgentRadius = 1.8, AgentHeight = 5.4, AgentCanJump = true, AgentCanClimb = true, WaypointSpacing = 5 })
+			--  [IA v2] Un solo Path por bot (antes uno nuevo en cada busqueda) y
+			--  cada calculo paga del presupuesto global (espera si no alcanza).
+			state.pathProbe = state.pathProbe or PathfindingService:CreatePath({ AgentRadius = 1.8, AgentHeight = 5.4, AgentCanJump = true, AgentCanClimb = true, WaypointSpacing = 5 })
+			local path = state.pathProbe
 			for index = 1, math.min(#list, 6) do
+				if not isAlive(state) or state.perch then break end
+				local waited = 0
+				while not Tac.takePathToken("perch") and waited < 5 do
+					waited += task.wait(0.25)
+				end
 				if not isAlive(state) or state.perch then break end
 				local candidate = list[index]
 				local ok = pcall(function() path:ComputeAsync(state.root.Position, candidate.pos) end)
@@ -4070,18 +4967,19 @@ end
 --  enemigo no lo ve; si no hay, DETRAS del caido respecto al enemigo (asi,
 --  mirando al caido tambien mira al enemigo y le puede disparar).
 function Tac.revivePosition(state, victimPos, threat)
+	--  [IA v2] Filtros una sola vez (antes se armaban en cada vuelta del bucle).
+	Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
+	Tac.params.FilterDescendantsInstances = Tac.worldFilter()
 	local threatEye = threat + Vector3.new(0, 2, 0)
 	local best, bestDist = nil, nil
 	for i = 0, 7 do
 		local angle = i * math.pi / 4
 		for _, radius in ipairs({ 4, 7 }) do
-			Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
 			local probe = victimPos + Vector3.new(math.cos(angle) * radius, 4, math.sin(angle) * radius)
 			local ground = workspace:Raycast(probe, Vector3.new(0, -10, 0), Tac.probeParams)
 			if ground and ground.Normal.Y > 0.7 then
 				local spot = ground.Position
 				local head = spot + Vector3.new(0, 2.4, 0)
-				Tac.params.FilterDescendantsInstances = Tac.worldFilter()
 				local hit = workspace:Raycast(threatEye, head - threatEye, Tac.params)
 				local covered = hit and (hit.Position - head).Magnitude > 1.2 and not isSeeThrough(hit.Instance)
 				local seesVictim = not workspace:Raycast(head, (victimPos + Vector3.new(0, 0.5, 0)) - head, Tac.params)
@@ -4095,7 +4993,6 @@ function Tac.revivePosition(state, victimPos, threat)
 	if best then return best end
 	local away = flat(victimPos - threat)
 	if away.Magnitude < 1 then return nil end
-	Tac.probeParams.FilterDescendantsInstances = Tac.worldFilter()
 	local ground = workspace:Raycast(victimPos + away.Unit * 5 + Vector3.new(0, 4, 0), Vector3.new(0, -10, 0), Tac.probeParams)
 	return ground and ground.Position or nil
 end
@@ -4249,7 +5146,8 @@ local function stepBrain(state, now, dt)
 	if now >= state.nextThink then
 		local thinkDt = math.min(now - state.lastThink, 0.5)
 		state.lastThink = now
-		state.nextThink = now + 1 / Config.Perception.ThinkRate
+		--  [IA v2] Lejos de jugadores reales y sin pelea, piensa mas lento (lod).
+		state.nextThink = now + 1 / (Config.Perception.ThinkRate * (state.lod or 1))
 		think(state, now, thinkDt)
 		updateAnimation(state)
 	end
@@ -4261,6 +5159,8 @@ local function stepBrain(state, now, dt)
 	--  [23/09 noche] Abriendo una puerta: quieto hasta que termine de girar.
 	if now >= (state.doorWaitUntil or 0) and not (Tac.updateSlide and Tac.updateSlide(state, now)) then
 		stepMovement(state, now)
+		--  [IA v2] Saltar, trepar, cruzar huecos, esquivar.
+		if Tac.parkour then Tac.parkour(state, now) end
 	end
 	--  [23/09 noche] En el agua: subir a la orilla, o subir / bucear si se atora.
 	if Tac.swimAssist then Tac.swimAssist(state, now) end
@@ -4270,6 +5170,8 @@ end
 
 RunService.Heartbeat:Connect(function(dt)
 	local now = os.clock()
+	--  [IA v2] Recarga del presupuesto de caminos (ver Tac.takePathToken).
+	Tac.pathTokens = math.min(Tac.AI.PathBurst, Tac.pathTokens + dt * Tac.AI.PathBudget)
 	for _, state in pairs(brains) do
 		if not state.dead then
 			local ok, err = pcall(stepBrain, state, now, dt)
@@ -4406,6 +5308,8 @@ local function newBrain(bot, meta, character)
 		downed = "", proneArmed = false, reviveFace = nil, downedSince = 0, nextStrugglePress = 0,
 		--  [fase 3] postura (0 de pie, 1 agachado) y ventarron
 		stance = 0, stanceTweens = {}, galeExposed = false, nextSkyCheck = 0,
+		--  [IA v2] vueltas de decisiones (cache de enemigos) y ritmo de pensar
+		thinkTick = 0, lod = 1,
 	}
 
 	--  [tacticas] Su equipo propio (principal al azar + Ithaca + Glock).
@@ -4444,9 +5348,16 @@ local function newBrain(bot, meta, character)
 		local dropped = health < lastHealth
 		lastHealth = health
 		if dropped then state.lastDamageAt = os.clock() end		-- [tacticas] para la cobertura
-		if not dropped or state.dead or state.visible then return end
+		if not dropped or state.dead then return end
 		local attackerId = tonumber(humanoid:GetAttribute("ACS_KillKillerUserId"))
 		local attacker = attackerId and (Players:GetPlayerByUserId(attackerId) or Registry.byUserId(attackerId))
+		--  [IA v2] Quien le pego pasa a ser su prioridad (ver perceive), aunque
+		--  este peleando con otro.
+		if attacker and attacker ~= bot then
+			state.lastAttacker = attacker
+			state.lastAttackerAt = os.clock()
+		end
+		if state.visible then return end
 		local attackerChar = attacker and attacker.Character
 		local attackerRoot = attackerChar and attackerChar:FindFirstChild("HumanoidRootPart")
 		if attackerRoot then
@@ -4661,7 +5572,14 @@ end)
 Evt.Atirar.OnServerEvent:Connect(function(player)
 	local character = player.Character
 	local root = character and character:FindFirstChild("HumanoidRootPart")
-	if root then notifyNoise(root.Position, player, 1) end
+	if not root then return end
+	--  [IA v2] Un bot en la linea de tiro del jugador la "siente" (la cabeza
+	--  sigue la mira de ACS; es aproximado, por eso el radio es mas grande).
+	local head = character:FindFirstChild("Head")
+	if head and Tac.bulletWhiz then
+		Tac.bulletWhiz(player, head.Position, head.CFrame.LookVector, 600, os.clock(), Tac.AI.WhizRadius * 1.4)
+	end
+	notifyNoise(root.Position, player, 1)
 end)
 
 --==========================================================================
