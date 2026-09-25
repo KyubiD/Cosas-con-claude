@@ -93,6 +93,32 @@ local function hide(character)
 	end
 end
 
+--  El Humanoid fuerza CanCollide = false en brazos y piernas aunque se lo
+--  cambiemos, y sin el Humanoid no se ve la ropa. Cada parte del cuerpo
+--  lleva soldada una colision invisible que el Humanoid no toca.
+local function addColliders(copy)
+	for _, limb in ipairs(copy:GetChildren()) do
+		if limb:IsA("BasePart") and limb.Name ~= "HumanoidRootPart" then
+			local collider = Instance.new("Part")
+			collider.Name = "Colision"
+			collider.Size = limb.Size
+			collider.CFrame = limb.CFrame
+			collider.Transparency = 1
+			collider.CastShadow = false
+			collider.Massless = true
+			collider.CanCollide = true
+			collider.CanQuery = false
+			collider.CanTouch = false
+			collider.CollisionGroup = CORPSE_GROUP
+			local weld = Instance.new("WeldConstraint")
+			weld.Part0 = limb
+			weld.Part1 = collider
+			weld.Parent = collider
+			collider.Parent = limb
+		end
+	end
+end
+
 local function makeCorpse(character)
 	if not character.Parent then return end
 	local wasArchivable = character.Archivable
@@ -121,16 +147,11 @@ local function makeCorpse(character)
 			instance.CanQuery = false
 			instance.CanTouch = false
 			instance.CollisionGroup = CORPSE_GROUP
-			--  Brazos y piernas vienen sin colision (la maneja el Humanoid, que
-			--  aqui esta apagado): sin esto atraviesan el suelo. Los accesorios
-			--  no son hijos directos del modelo y se quedan sin colision.
-			if instance.Parent == copy then
-				instance.CanCollide = true
-			end
 		end
 	end
 	local root = copy:FindFirstChild("HumanoidRootPart")
 	if root then root.CanCollide = false end
+	addColliders(copy)
 
 	hide(character)
 
