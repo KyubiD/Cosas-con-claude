@@ -127,6 +127,8 @@ Tac.AI = {
 	MantleMaxHeight = 6.5,		-- bordes hasta esta altura se trepan (0 = nunca)
 	GapMax = 8,					-- huecos hasta este largo se saltan (0 = nunca)
 	JumpCooldown = 0.55,
+	JumpLoopLimit = 5,			-- saltos en el mismo lugar antes de rendirse con esa ruta
+	BlockedSpotTime = 20,		-- s que recuerda un lugar donde no pudo subir
 	--  Oido
 	NoiseThrottle = 0.2,		-- un mismo tirador avisa como mucho cada tanto
 	WallMuffle = 0.55,			-- a traves de paredes el disparo se oye a esta fraccion
@@ -1280,6 +1282,13 @@ local function requestPath(state, goal, kind)
 	--  Un objetivo inalcanzable (arriba de un techo) no debe pedir 8 caminos
 	--  por segundo.
 	if now - state.lastRepath < 0.45 then return end
+	--  [IA v2] Destino donde hace poco no pudo subir: fallado sin calcular,
+	--  asi la tactica que lo pidio elige otro (en vez de volver a la pared).
+	if Tac.nearBlocked(state, goal) then
+		state.lastRepath = now
+		state.pathFails += 1
+		return
+	end
 	--  [IA v2] El destino casi no se movio y el camino actual sigue en pie:
 	--  se sigue usando (es lo que mas CPU ahorra con muchos bots).
 	if state.moveMode == "path" and state.waypoints and state.pathGoal and state.pathKind == kind
@@ -1421,7 +1430,7 @@ local function stepMovement(state, now)
 		--  iba saltando todo el tramo). Los bordes altos los trepa el parkour.
 		if waypoint.Action == Enum.PathWaypointAction.Jump and humanoid.FloorMaterial ~= Enum.Material.Air
 			and not state.galeExposed and now >= (state.nextJumpAt or 0)
-			and flat(waypoint.Position - root.Position).Magnitude < 4.5 then
+			and flat(waypoint.Position - root.Position).Magnitude < 4.5 and Tac.noteJump(state, now) then
 			humanoid.Jump = true
 			state.nextJumpAt = now + Tac.AI.JumpCooldown
 		end
@@ -1506,6 +1515,9 @@ local function checkStuck(state, now)
 	local stuckFor = now - state.progressAt
 	if stuckFor > M.StuckGiveUp then
 		state.progressAt = now
+		--  [IA v2] Segunda vez que se atasca yendo al mismo destino: ese
+		--  destino no se alcanza (el camino dice que si, el cuerpo no puede).
+		if Tac.noteStuck(state, now) then return end
 		state.pathFails += 1
 		state.nextRoamAt = now
 		--  [IA v2] El proximo camino se prueba primero con saltos y angosto.
@@ -1518,7 +1530,7 @@ local function checkStuck(state, now)
 		state.progressAt = now
 	elseif stuckFor > M.StuckJump and now - state.lastJump > 0.9 and not state.galeExposed then
 		state.lastJump = now
-		state.humanoid.Jump = true
+		if Tac.noteJump(state, now) then state.humanoid.Jump = true end
 	end
 end
 
@@ -1914,7 +1926,7 @@ local function decideMovement(state, now)
 				state.pushUntil = now + 2.5
 				state.pushing = state.rng:NextNumber() < Tac.AI.PushChance
 			end
-			if state.pushing then
+			if state.pushing and state.pathFails < 3 then
 				humanoid.WalkSpeed = RUN_SPEED
 				requestPath(state, target.root.Position, "chase")
 				return
@@ -1937,7 +1949,11 @@ local function decideMovement(state, now)
 		elseif dist > idealMax * 1.15 then
 			--  Muy lejos para el arma que tiene: se acerca.
 			if dist > idealMax * 2 then humanoid.WalkSpeed = WALK_SPEED end
-			if state.pathKind ~= "chase" or not state.waypoints or now - state.lastRepath > M.RepathMoving then
+			--  [IA v2] No hay forma de llegar (en un techo, un balcon): se queda
+			--  disparando desde donde esta y reintenta cada tanto.
+			if state.pathFails >= 3 and now - state.lastRepath < 5 then
+				if state.moveMode == "path" or state.moveMode == "direct" then stopWalking(state) end
+			elseif state.pathKind ~= "chase" or not state.waypoints or now - state.lastRepath > M.RepathMoving then
 				requestPath(state, target.root.Position, "chase")
 			end
 		elseif dist < idealMin then
@@ -2622,6 +2638,10 @@ end
 --  de atorar) primero el que salta; si se atoro, primero el angosto.
 function Tac.pathOrder(state, startPos, goal)
 	local now = os.clock()
+	--  Acaba de rendirse con un salto que no le daba: solo caminos sin saltar.
+	if state.noJumpPathUntil and now < state.noJumpPathUntil then
+		return { state.path }
+	end
 	local list
 	if goal.Y - startPos.Y > 4 or (state.preferJumpUntil and now < state.preferJumpUntil) then
 		list = { state.pathJump, state.path }
@@ -2646,8 +2666,17 @@ function Tac.directFallback(state, goal)
 	if state.moveMode == "strafe" then return end
 	--  Peleando, el movimiento lo decide el combate (salvo que fuera a perseguir).
 	if state.visible and state.pathKind ~= "chase" then return end
-	local delta = goal - state.root.Position
+	local root = state.root
+	local delta = goal - root.Position
 	if flat(delta).Magnitude > AI.DirectRange or delta.Y > AI.MantleMaxHeight + 3 then return end
+	--  Ya se rindio aca hace poco: no insistir.
+	if Tac.nearBlocked(state, root.Position) or Tac.nearBlocked(state, goal) then return end
+	--  Una pared mas alta de lo que puede trepar en el medio: ni lo intenta
+	--  (si no, se quedaba contra la pared saltando).
+	local feetY = root.Position.Y - state.humanoid.HipHeight - root.Size.Y * 0.5
+	local from = Vector3.new(root.Position.X, feetY + math.max(AI.MantleMaxHeight, 3.5) + 1, root.Position.Z)
+	Tac.moveParams.FilterDescendantsInstances = Tac.worldFilter()
+	if workspace:Raycast(from, Vector3.new(goal.X, from.Y, goal.Z) - from, Tac.moveParams) then return end
 	local now = os.clock()
 	state.waypoints = nil
 	state.moveMode = "direct"
@@ -2657,6 +2686,95 @@ function Tac.directFallback(state, goal)
 	state.lastMoveTarget = nil
 	state.humanoid:MoveTo(goal)
 	state.lastMoveToAt = now
+end
+
+--  Lugares donde se rindio de subir (se recuerdan BlockedSpotTime segundos).
+function Tac.nearBlocked(state, pos)
+	local list = state.blockedSpots
+	if not list then return false end
+	local now = os.clock()
+	for i = #list, 1, -1 do
+		local spot = list[i]
+		if now > spot.untilT then
+			table.remove(list, i)
+		elseif flat(spot.pos - pos).Magnitude < 6 then
+			return true
+		end
+	end
+	return false
+end
+
+--  Se atasco (sin avanzar StuckGiveUp segundos). true si fue la segunda vez
+--  yendo al mismo destino y se rindio con el.
+function Tac.noteStuck(state, now)
+	if state.moveMode ~= "path" and state.moveMode ~= "direct" then return false end
+	local goal = state.pathGoal or state.directGoal
+	if not goal then return false end
+	local last = state.stuckGoal
+	if last and (last.pos - goal).Magnitude < 8 and now - last.at < 25 then
+		last.count += 1
+		last.at = now
+	else
+		state.stuckGoal = { pos = goal, count = 1, at = now }
+	end
+	if state.stuckGoal.count >= 2 then
+		Tac.abandonRoute(state, now)
+		return true
+	end
+	return false
+end
+
+--  Cuantas veces salto (o trepo) ya en este mismo lugar, hace poco.
+function Tac.jumpsHere(state, now)
+	local spot = state.jumpSpot
+	if spot and now - spot.lastAt < 4 and flat(state.root.Position - spot.pos).Magnitude < 3 then
+		return spot.count
+	end
+	return 0
+end
+
+--  Anota un salto. Si ya van JumpLoopLimit en el mismo lugar (un borde que
+--  el camino da por bueno pero no le alcanza el salto), se rinde con esa
+--  ruta y devuelve false: el que llama no salta.
+function Tac.noteJump(state, now)
+	local count = Tac.jumpsHere(state, now) + 1
+	if count == 1 then
+		state.jumpSpot = { pos = state.root.Position, count = 1, lastAt = now }
+	else
+		state.jumpSpot.count = count
+		state.jumpSpot.lastAt = now
+	end
+	if count >= Tac.AI.JumpLoopLimit then
+		state.jumpSpot = nil
+		Tac.abandonRoute(state, now)
+		return false
+	end
+	return true
+end
+
+--  No hay forma de pasar por aca: recuerda el lugar, calcula los proximos
+--  caminos sin saltos, da por fallado el destino (cada tactica elige otro)
+--  y se aleja un paso de la pared.
+function Tac.abandonRoute(state, now)
+	local here = state.root.Position
+	state.blockedSpots = state.blockedSpots or {}
+	table.insert(state.blockedSpots, { pos = here, untilT = now + Tac.AI.BlockedSpotTime })
+	--  El destino tambien: requestPath lo da por fallado sin calcular.
+	local goal = state.pathGoal or state.directGoal
+	if goal then table.insert(state.blockedSpots, { pos = goal, untilT = now + Tac.AI.BlockedSpotTime }) end
+	while #state.blockedSpots > 10 do table.remove(state.blockedSpots, 1) end
+	state.stuckGoal = nil
+	state.noJumpPathUntil = now + 12
+	state.preferJumpUntil = nil
+	state.pathFails += 3
+	state.nextRoamAt = now
+	state.lastRepath = now
+	state.mantle, state.boost = nil, nil
+	local away = -flat(state.humanoid.MoveDirection)
+	if away.Magnitude < 0.3 then away = -flat(state.root.CFrame.LookVector) end
+	if away.Magnitude < 0.3 then away = Vector3.new(1, 0, 0) end
+	startStrafe(state, now, away.Unit + state.root.CFrame.RightVector * (state.rng:NextNumber() < 0.5 and -0.5 or 0.5), 0.7)
+	dprint(state.bot.Name, "no puede subir por aca: cambia de ruta")
 end
 
 --  A donde esta caminando ahora mismo.
@@ -2869,6 +2987,8 @@ function Tac.parkour(state, now)
 	dir = dir.Unit
 
 	if (mode == "path" or state.directGoal) and Tac.bumpCheck(state, now, dir) then return end
+	--  Aca ya se rindio hace poco: no vuelve a saltar contra la misma pared.
+	if Tac.nearBlocked(state, root.Position) then return end
 
 	local hip = humanoid.HipHeight
 	local feetY = root.Position.Y - hip - root.Size.Y * 0.5
@@ -2920,17 +3040,20 @@ function Tac.parkour(state, now)
 			end
 		end
 		if ledge and ledge <= hip * 0.8 then return end		-- el Humanoid lo sube solo
-		if ledge and ledge <= canJump then
-			if now >= (state.nextJumpAt or 0) then
+		--  Si ya salto dos veces aca y no paso, el salto normal no le alcanza:
+		--  trepa con impulso (si el borde no es demasiado alto).
+		local canMantle = ledge ~= nil and ledge <= AI.MantleMaxHeight
+		if ledge and ledge <= canJump and not (canMantle and Tac.jumpsHere(state, now) >= 2) then
+			if now >= (state.nextJumpAt or 0) and Tac.noteJump(state, now) then
 				humanoid.Jump = true
 				state.nextJumpAt = now + AI.JumpCooldown
 			end
 			return
 		end
-		if ledge and ledge <= AI.MantleMaxHeight and now >= (state.nextMantleAt or 0)
+		if canMantle and now >= (state.nextMantleAt or 0)
 			and (mode ~= "strafe" or blocked)
 			and not workspace:Raycast(root.Position, Vector3.new(0, ledge + 1, 0), params) then
-			Tac.startMantle(state, now, dir, topY, ledge)
+			if Tac.noteJump(state, now) then Tac.startMantle(state, now, dir, topY, ledge) end
 			return
 		end
 		Tac.avoidWall(state, now, dir, base, params)
