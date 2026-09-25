@@ -16,6 +16,7 @@
 ]]
 
 local Players = game:GetService("Players")
+local PhysicsService = game:GetService("PhysicsService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
 
@@ -27,6 +28,14 @@ local phaseValue = state:WaitForChild("Phase")
 local RAGDOLL_WAIT = 0.3	-- s para que el ragdoll de ACS termine de armarse
 local SETTLE_TIME = 5		-- s de fisica antes de dejarlo fijo
 local MAX_CORPSES = 40
+
+--  Las extremidades se solapan en las articulaciones: si chocaran entre si
+--  el ragdoll temblaria o saldria disparado. Este grupo no choca consigo mismo.
+local CORPSE_GROUP = "Cuerpos"
+if not PhysicsService:IsCollisionGroupRegistered(CORPSE_GROUP) then
+	PhysicsService:RegisterCollisionGroup(CORPSE_GROUP)
+end
+PhysicsService:CollisionGroupSetCollidable(CORPSE_GROUP, CORPSE_GROUP, false)
 
 local REMOVE_CLASSES = {
 	"LuaSourceContainer", "Tool", "BillboardGui", "SurfaceGui", "Sound",
@@ -111,6 +120,13 @@ local function makeCorpse(character)
 			instance.Anchored = false
 			instance.CanQuery = false
 			instance.CanTouch = false
+			instance.CollisionGroup = CORPSE_GROUP
+			--  Brazos y piernas vienen sin colision (la maneja el Humanoid, que
+			--  aqui esta apagado): sin esto atraviesan el suelo. Los accesorios
+			--  no son hijos directos del modelo y se quedan sin colision.
+			if instance.Parent == copy then
+				instance.CanCollide = true
+			end
 		end
 	end
 	local root = copy:FindFirstChild("HumanoidRootPart")
