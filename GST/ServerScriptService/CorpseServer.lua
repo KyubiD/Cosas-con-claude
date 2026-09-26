@@ -69,7 +69,9 @@ local function strip(copy)
 		if instance.Parent and instance.Name == "ACS_Client" then instance:Destroy() end
 	end
 	for _, instance in ipairs(copy:GetDescendants()) do
-		if instance.Parent then
+		--  Aspecto = el dibujo de la ropa de los bots (camuflaje, bolsillos...):
+		--  se queda para que el cuerpo se vea igual.
+		if instance.Parent and not instance:GetAttribute("Aspecto") then
 			for _, className in ipairs(REMOVE_CLASSES) do
 				if instance:IsA(className) then
 					instance:Destroy()
@@ -89,6 +91,8 @@ local function hide(character)
 			instance.CanQuery = false
 		elseif instance:IsA("Decal") or instance:IsA("Texture") then
 			instance.Transparency = 1
+		elseif instance:IsA("SurfaceGui") then
+			instance.Enabled = false		-- se dibuja aunque la pieza sea invisible
 		end
 	end
 end

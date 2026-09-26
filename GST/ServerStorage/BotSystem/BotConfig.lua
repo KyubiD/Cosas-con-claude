@@ -108,14 +108,23 @@ BotConfig.Avatar = {
 	--======================================================================
 	--  ESTILOS  [25/09]  (uno al azar por bot, con estos pesos)
 	--
-	--  El uniforme es el color del cuerpo con textura de tela y el equipo
-	--  son piezas pegadas al cuerpo (no hace falta ningun ID del catalogo).
-	--  Las piezas no chocan ni frenan balas: la hitbox es la de siempre.
+	--  El uniforme es el color del cuerpo y el equipo son piezas pegadas al
+	--  cuerpo (no hace falta ningun ID del catalogo). Las piezas no chocan
+	--  ni frenan balas: la hitbox es la de siempre.
+	--  [26/09] Cada pieza con su material (casco liso, botas y cinturon de
+	--  cuero, suelas y rodilleras de goma, hebilla y soportes de metal...) y
+	--  el detalle va dibujado encima con SurfaceGui: camuflaje, costuras,
+	--  bolsillos, cierre, cinta con el nombre, parches, cintas MOLLE,
+	--  cordones. Tampoco usa IDs.
 	--
 	--  Kind      "Militar", "Civil" o "Clasico" (el avatar liso de antes).
 	--  Top / Bottom   colores de la parte de arriba (torso y mangas) y de
 	--                 las piernas. Uno al azar de cada lista.
 	--  Camo      colores de las manchas de camuflaje (vacio = liso).
+	--  Pattern   dibujo del camuflaje: "Manchas" (bosque), "Pintas"
+	--            (desierto: manchas + pintitas), "Digital" (pixelado) o
+	--            "Liso" (sin camuflaje, solo costuras y bolsillos).
+	--  CamoAmount     cuantas manchas por cara (mas = mas cargado).
 	--  Vest      color del chaleco / mochila / cinturon (y del casco si no
 	--            hay HeadgearColors).
 	--  Headgear  { Tipo = peso }: Casco, Gorra, Gorro, Boonie, Boina, Ninguno.
@@ -125,11 +134,14 @@ BotConfig.Avatar = {
 	--  Gloves / Boots / MaskColors / ScarfColors   colores de esas piezas.
 	--  HairChance     pelo (solo si no lleva nada en la cabeza).
 	--  Civil: CatalogChance = prob. de usar Shirts/Pants de arriba en vez
-	--         de ropa lisa; ShortSleeveChance = remera de manga corta.
+	--         de ropa lisa; ShortSleeveChance = remera de manga corta;
+	--         HoodieChance / JacketChance = con manga larga, buzo con
+	--         capucha o campera abierta (si no, remera con dibujo).
 	--======================================================================
 	Styles = {
 		{ Name = "Civil", Kind = "Civil", Weight = 26,
 			CatalogChance = 0.45, ShortSleeveChance = 0.55, HairChance = 0.85,
+			HoodieChance = 0.35, JacketChance = 0.3,
 			Top = {
 				Color3.fromRGB(35, 35, 38), Color3.fromRGB(235, 235, 235), Color3.fromRGB(120, 30, 35),
 				Color3.fromRGB(40, 60, 110), Color3.fromRGB(95, 95, 100), Color3.fromRGB(70, 90, 60),
@@ -148,7 +160,7 @@ BotConfig.Avatar = {
 		},
 		{ Name = "Clasico", Kind = "Clasico", Weight = 5 },
 
-		{ Name = "Bosque", Kind = "Militar", Weight = 12, HairChance = 0.3,
+		{ Name = "Bosque", Kind = "Militar", Weight = 12, HairChance = 0.3, Pattern = "Manchas", CamoAmount = 7,
 			Top = { Color3.fromRGB(85, 94, 54), Color3.fromRGB(74, 83, 52), Color3.fromRGB(92, 98, 66) },
 			Bottom = { Color3.fromRGB(78, 85, 55), Color3.fromRGB(66, 72, 48) },
 			Camo = { Color3.fromRGB(46, 54, 34), Color3.fromRGB(96, 78, 52), Color3.fromRGB(32, 34, 28), Color3.fromRGB(112, 120, 80) },
@@ -161,7 +173,7 @@ BotConfig.Avatar = {
 			ScarfColors = { Color3.fromRGB(60, 66, 44), Color3.fromRGB(90, 80, 60) },
 			MaskColors = { Color3.fromRGB(45, 50, 38) },
 		},
-		{ Name = "Nieve", Kind = "Militar", Weight = 8, HairChance = 0.2,
+		{ Name = "Nieve", Kind = "Militar", Weight = 8, HairChance = 0.2, Pattern = "Manchas", CamoAmount = 5,
 			Top = { Color3.fromRGB(235, 238, 240), Color3.fromRGB(220, 224, 228), Color3.fromRGB(205, 210, 214) },
 			Bottom = { Color3.fromRGB(225, 228, 232), Color3.fromRGB(200, 205, 210) },
 			Camo = { Color3.fromRGB(170, 178, 186), Color3.fromRGB(140, 148, 156), Color3.fromRGB(250, 250, 250) },
@@ -175,7 +187,7 @@ BotConfig.Avatar = {
 			ScarfColors = { Color3.fromRGB(240, 240, 240), Color3.fromRGB(170, 175, 180) },
 			MaskColors = { Color3.fromRGB(240, 240, 240), Color3.fromRGB(190, 195, 200) },
 		},
-		{ Name = "Desierto", Kind = "Militar", Weight = 9, HairChance = 0.3,
+		{ Name = "Desierto", Kind = "Militar", Weight = 9, HairChance = 0.3, Pattern = "Pintas", CamoAmount = 6,
 			Top = { Color3.fromRGB(194, 170, 125), Color3.fromRGB(180, 155, 110), Color3.fromRGB(205, 185, 140) },
 			Bottom = { Color3.fromRGB(185, 160, 115), Color3.fromRGB(170, 148, 105) },
 			Camo = { Color3.fromRGB(150, 120, 80), Color3.fromRGB(215, 195, 150), Color3.fromRGB(130, 105, 70) },
@@ -187,10 +199,11 @@ BotConfig.Avatar = {
 			Boots = { Color3.fromRGB(140, 110, 75), Color3.fromRGB(95, 75, 55) },
 			ScarfColors = { Color3.fromRGB(200, 185, 150), Color3.fromRGB(110, 120, 90), Color3.fromRGB(60, 60, 60) },
 		},
-		{ Name = "Nocturno", Kind = "Militar", Weight = 9, HairChance = 0.15,
+		--  Nocturno: camuflaje negro muy suave (casi no se nota de lejos).
+		{ Name = "Nocturno", Kind = "Militar", Weight = 9, HairChance = 0.15, Pattern = "Manchas", CamoAmount = 5,
 			Top = { Color3.fromRGB(28, 30, 32), Color3.fromRGB(38, 40, 44), Color3.fromRGB(22, 24, 28) },
 			Bottom = { Color3.fromRGB(32, 34, 38), Color3.fromRGB(26, 28, 30) },
-			Camo = {},
+			Camo = { Color3.fromRGB(16, 17, 19), Color3.fromRGB(50, 52, 56) },
 			Vest = { Color3.fromRGB(20, 20, 22), Color3.fromRGB(45, 48, 40), Color3.fromRGB(35, 38, 45) },
 			Headgear = { Casco = 6, Gorra = 1, Gorro = 1 },
 			Gear = { Chaleco = 0.95, Mochila = 0.25, Cinturon = 0.9, Rodilleras = 0.7, Guantes = 0.9, Pasamontanas = 0.5,
@@ -199,7 +212,7 @@ BotConfig.Avatar = {
 			Boots = { Color3.fromRGB(20, 20, 20) },
 			MaskColors = { Color3.fromRGB(22, 22, 24) },
 		},
-		{ Name = "Urbano", Kind = "Militar", Weight = 9, HairChance = 0.3,
+		{ Name = "Urbano", Kind = "Militar", Weight = 9, HairChance = 0.3, Pattern = "Digital", CamoAmount = 9,
 			Top = { Color3.fromRGB(95, 100, 108), Color3.fromRGB(120, 124, 130), Color3.fromRGB(70, 74, 80) },
 			Bottom = { Color3.fromRGB(80, 84, 90), Color3.fromRGB(60, 62, 68) },
 			Camo = { Color3.fromRGB(50, 52, 58), Color3.fromRGB(150, 152, 158), Color3.fromRGB(35, 36, 40) },
@@ -212,7 +225,7 @@ BotConfig.Avatar = {
 			MaskColors = { Color3.fromRGB(30, 30, 32), Color3.fromRGB(80, 84, 90) },
 		},
 		--  Contratista: ropa de civil (remera, caqui, jeans) con equipo tactico.
-		{ Name = "Contratista", Kind = "Militar", Weight = 8, HairChance = 0.6, ShortSleeveChance = 0.5,
+		{ Name = "Contratista", Kind = "Militar", Weight = 8, HairChance = 0.6, ShortSleeveChance = 0.5, Pattern = "Liso",
 			Top = { Color3.fromRGB(40, 40, 40), Color3.fromRGB(90, 90, 95), Color3.fromRGB(50, 70, 90), Color3.fromRGB(150, 135, 110), Color3.fromRGB(225, 225, 225) },
 			Bottom = { Color3.fromRGB(170, 150, 115), Color3.fromRGB(60, 62, 66), Color3.fromRGB(55, 60, 80) },
 			Camo = {},
@@ -224,8 +237,17 @@ BotConfig.Avatar = {
 		},
 	},
 	--  Tope de piezas de equipo por bot (rendimiento con muchos bots).
-	MaxGearParts = 40,
-	--  Manchas de camuflaje por bot (0 = uniforme liso).
+	MaxGearParts = 50,
+	--  [26/09] Detalle dibujado (SurfaceGui):
+	--    2 = todo (brazos, canillas, costados del chaleco, cordones...)
+	--    1 = solo lo principal (torso, muslos, chaleco, mochila)
+	--    0 = nada dibujado: camuflaje con piezas como antes (CamoPatches)
+	--  Si con muchos bots el juego va lento, bajar a 1.
+	DetailLevel = 2,
+	--  Distancia (studs) hasta la que se ve el dibujo. Mas lejos solo se ve
+	--  el color liso (nadie nota la diferencia y ahorra rendimiento).
+	DetailDistance = 110,
+	--  Manchas de camuflaje con piezas (solo con DetailLevel = 0).
 	CamoPatches = 6,
 }
 
