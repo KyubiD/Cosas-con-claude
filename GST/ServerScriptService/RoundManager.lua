@@ -2006,7 +2006,10 @@ local function runRoundCycle()
 	if requiredPart then
 		local map = winningMap and getMap(winningMap)
 		if not (map and map:FindFirstChild(requiredPart, true)) then
-			dprint("[RoundManager]", winningGamemode, "no se juega en", winningMap, "-> Arcade")
+			--  warn (no dprint): si pasa en un mapa que SI deberia tenerla (Prision),
+			--  en Output se ve que pieza falta.
+			warn(string.format("[RoundManager] %s necesita una pieza '%s' dentro del mapa '%s' y no la encontre -> se juega Arcade",
+				tostring(winningGamemode), tostring(requiredPart), tostring(winningMap)))
 			winningGamemode = GAMEMODE_RULES.Arcade and "Arcade" or DEFAULT_GAMEMODE
 		end
 	end
