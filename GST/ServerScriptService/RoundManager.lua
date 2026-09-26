@@ -1378,8 +1378,23 @@ function Control.buildBorder(part)
 	local model = Instance.new("Model")
 	model.Name = "ControlBorde"
 	local upVector, aVector, bVector, top, halfA, halfB = Control.axes(part)
+	--  A que altura: si el area es una placa fina, sobre su tapa; si es una
+	--  caja alta (un volumen donde uno se para ADENTRO), en el piso que tiene
+	--  debajo, no en su tapa (quedaba en el techo o flotando en el aire).
 	local center = part.Position + upVector * (top + 0.15)
-	local thick, postHeight = 0.5, 7
+	if top > 1.25 then
+		local params = RaycastParams.new()
+		params.FilterType = Enum.RaycastFilterType.Exclude
+		local ignore = { part }
+		for _, player in ipairs(Players:GetPlayers()) do
+			if player.Character then table.insert(ignore, player.Character) end
+		end
+		params.FilterDescendantsInstances = ignore
+		local hit = Workspace:Raycast(part.Position + upVector * top, -upVector * (top * 2 + 30), params)
+		local floor = hit and (hit.Position - part.Position):Dot(upVector) or -top
+		center = part.Position + upVector * (math.max(floor, -top - 30) + 0.15)
+	end
+	local thick, postHeight = 0.6, 9
 	local function piece(size, cframe)
 		local edge = Instance.new("Part")
 		edge.Name = "Borde"
@@ -1422,7 +1437,17 @@ function Control.buildBorder(part)
 	for _, corner in ipairs(corners) do
 		piece(Vector3.new(thick, postHeight, thick), CFrame.fromMatrix(corner + upVector * (postHeight / 2), aVector, upVector))
 	end
+	--  Y un contorno (Highlight) de la pieza misma, del mismo color.
+	local outline = Instance.new("Highlight")
+	outline.Name = "ControlContorno"
+	outline.Adornee = part
+	outline.FillTransparency = 1
+	outline.OutlineTransparency = 0
+	outline.OutlineColor = Color3.new(1, 1, 1)
+	outline.DepthMode = Enum.HighlightDepthMode.Occluded
+	outline.Parent = model
 	model.Parent = part.Parent
+	print(string.format("[RoundManager] Control: area '%s' con %d bordes a la altura Y=%.1f", part:GetFullName(), #model:GetChildren() - 1, center.Y))
 	return model
 end
 
@@ -1437,7 +1462,11 @@ function Control.colorBorder(holder, present)
 		color = Control.teamColor(holder)
 	end
 	for _, edge in ipairs(border:GetChildren()) do
-		if edge:IsA("BasePart") then edge.Color = color end
+		if edge:IsA("BasePart") then
+			edge.Color = color
+		elseif edge:IsA("Highlight") then
+			edge.OutlineColor = color
+		end
 	end
 end
 
@@ -1628,7 +1657,12 @@ function Control.start(map)
 	label.Parent = board
 	board.Parent = part
 	Control.board, Control.label = board, label
-	Control.border = Control.buildBorder(part)
+	local borderOk, border = pcall(Control.buildBorder, part)
+	if borderOk then
+		Control.border = border
+	else
+		warn("[RoundManager] Control: no se pudieron poner los bordes: " .. tostring(border))
+	end
 	Control.playerPoints = {}
 	for _, player in ipairs(participants()) do
 		pcall(function() player:SetAttribute("ControlPoints", 0) end)

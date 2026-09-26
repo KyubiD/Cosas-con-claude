@@ -161,6 +161,7 @@ Tac.AI = {
 	QuietHunt = 12,				-- s sin oir nada antes de ir "a donde suele haber gente"
 	--  Pelea
 	AttackerPriority = 25,		-- cuanto prefiere a quien le acaba de disparar
+	ZoneTargetPriority = 45,	-- [26/09] Control: cuanto prefiere al enemigo parado en el area
 	OutnumberedHealth = 0.65,	-- con 2+ enemigos a la vista y menos vida que esto: cubrirse
 	ReloadCoverRange = 45,		-- recargando con un enemigo a menos de esto: buscar cobertura
 	PushChance = 0.55,			-- prob. de ir a rematar a un enemigo con poca vida
@@ -795,6 +796,7 @@ local function perceive(state, now, dt)
 	local enemies = gatherEnemies(state, state.viewDistance or P.ViewDistance)
 	local best, bestScore = nil, nil
 	local checks, seen = 0, 0
+	local zone = Tac.controlZone and Tac.controlZone()		-- [26/09] Control
 	for _, entry in ipairs(enemies) do
 		if checks >= 5 then break end
 		local toEnemy = flat(entry.root.Position - headPos)
@@ -802,13 +804,17 @@ local function perceive(state, now, dt)
 		local isCurrent = entry.character == currentChar and (now - state.lastSeenAt) < 1.5
 		--  [IA v2] El que le disparo se busca aunque este fuera del cono.
 		local isAttacker = attacker ~= nil and entry.participant == attacker
-		if inCone or isCurrent or isAttacker or entry.dist <= P.CloseAwareness then
+		--  [26/09] Control: el que esta parado en el area se busca aunque
+		--  este fuera del cono (el area avisa: cambia de color).
+		local inZone = zone ~= nil and Tac.inZone(zone, entry.root.Position, 0)
+		if inCone or isCurrent or isAttacker or inZone or entry.dist <= P.CloseAwareness then
 			checks += 1
 			if canSee(state, headPos, entry) then
 				seen += 1
 				local score = entry.dist
 				if isCurrent then score -= 30 end
 				if isAttacker then score -= AI.AttackerPriority end
+				if inZone then score -= AI.ZoneTargetPriority end		-- [26/09] primero el del area
 				--  [23/09 noche] Un abatido cerca se remata ya (antes quedaba
 				--  muy abajo en la lista y se le pasaba de lado).
 				if entry.downed then score += (entry.dist < 30 and 8 or 60) end
@@ -3518,10 +3524,21 @@ function Tac.tryReloadCover(state, now, target)
 	state.nextReloadCoverAt = now + 3
 	local spot = Tac.findCover(state, target.root.Position, 2)
 	if not spot or flat(spot - state.root.Position).Magnitude > 16 then return false end
+	if not Tac.zoneCoverOk(state, spot, "reload") then return false end		-- [26/09] Control
 	state.cover = { pos = spot, threat = target.root.Position, arrived = false, untilT = now + 6, reason = "reload" }
 	state.hold, state.watch = nil, nil
 	dprint(state.bot.Name, "se cubre para recargar")
 	return Tac.updateCover(state, now)
+end
+
+--  [26/09] Control: el punto va primero. Cubrirse solo DENTRO del area
+--  (para recargar o si lo superan en numero). Muy herido y ya afuera, si
+--  puede ir a cubrirse donde sea; adentro aguanta el punto.
+function Tac.zoneCoverOk(state, spot, reason)
+	local zone = Tac.controlZone and Tac.controlZone()
+	if not zone then return true end
+	if Tac.inZone(zone, spot + Vector3.new(0, 3, 0), 0.5) then return true end
+	return reason == "health" and not Tac.inZone(zone, state.root.Position, 0.5)
 end
 
 --  Lejos de todo jugador real y sin pelea: piensa a menor ritmo (nadie lo
@@ -3818,6 +3835,7 @@ function Tac.updateCover(state, now)
 	state.nextCoverTry = now + 3
 	local spot = Tac.findCover(state, threat)
 	if not spot then return false end
+	if not Tac.zoneCoverOk(state, spot, lowHealth and "health" or "outnumbered") then return false end		-- [26/09] Control
 	state.cover = { pos = spot, threat = threat, arrived = false, untilT = now + 12,
 		reason = lowHealth and "health" or "outnumbered" }
 	state.hold, state.watch = nil, nil
@@ -5962,6 +5980,17 @@ function Tac.zoneSpot(state, zone)
 	return nil
 end
 
+--  [26/09] El enemigo vivo (no abatido) parado en el area mas cercano, o nil.
+function Tac.zoneIntruder(state, zone)
+	local best, bestDist = nil, math.huge
+	for _, entry in ipairs(gatherEnemies(state, math.huge)) do
+		if not entry.downed and entry.dist < bestDist and Tac.inZone(zone, entry.root.Position, 0) then
+			best, bestDist = entry, entry.dist
+		end
+	end
+	return best
+end
+
 --  Fuera de pelea: al area y a quedarse adentro. true = se hizo cargo.
 function Tac.playObjective(state, now)
 	local zone = Tac.controlZone()
@@ -5970,6 +5999,20 @@ function Tac.playObjective(state, now)
 		return false
 	end
 	local root = state.root.Position
+	--  [26/09] Un enemigo en el area (sin verlo todavia): a sacarlo. Corre
+	--  hacia el, mirando hacia alli para verlo en cuanto asome.
+	local intruder = Tac.zoneIntruder(state, zone)
+	if intruder then
+		local where = intruder.root.Position
+		state.lookAt = where
+		state.lookUntil = now + 0.6
+		if flat(where - root).Magnitude > 6 then
+			Tac.goTo(state, now, where - Vector3.new(0, 3, 0), "zone", RUN_SPEED, 4)
+		elseif state.moveMode ~= "hold" then
+			stopWalking(state)
+		end
+		return true
+	end
 	local spot = state.zoneSpot
 	if not spot or now > (state.zoneSpotUntil or 0) then
 		spot = Tac.zoneSpot(state, zone) or Vector3.new(zone.Position.X, root.Y - 3, zone.Position.Z)
@@ -5997,9 +6040,22 @@ end
 --  Peleando en Control (lejos del enemigo). true = se hizo cargo.
 function Tac.fightForZone(state, now, dist)
 	local zone = Tac.controlZone()
-	if not zone or dist <= 10 then return false end
+	if not zone then return false end
 	local root = state.root.Position
-	if Tac.inZone(zone, root, 0.5) then
+	local target = state.target
+	local targetInZone = target and target.root and Tac.inZone(zone, target.root.Position, 0)
+	--  [26/09] El enemigo esta EN el area: prioridad sacarlo. De cerca, la
+	--  pelea normal (se le acerca, remata); de lejos, hacia el a paso de
+	--  combate disparando.
+	if targetInZone then
+		if dist <= 10 then return false end
+		Tac.goTo(state, now, target.root.Position - Vector3.new(0, 3, 0), "zone", Config.Movement.CombatSpeed, 4)
+		return true
+	end
+	local inside = Tac.inZone(zone, root, 0.5)
+	--  Afuera y con el enemigo encima: pelea normal.
+	if not inside and dist <= 10 then return false end
+	if inside then
 		--  Adentro: dispara sin salir; de lado solo si sigue adentro.
 		if state.moveMode == "path" or state.moveMode == "direct"
 			or (state.moveMode == "strafe" and state.strafeDir and not Tac.inZone(zone, root + state.strafeDir * 4, 0.5)) then
