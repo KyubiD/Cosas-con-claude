@@ -1936,6 +1936,10 @@ local function decideMovement(state, now)
 			return
 		end
 
+		--  [26/09] Control: sumar puntos es estar en el area (adentro no sale
+		--  a perseguir; de afuera va hacia ella disparando).
+		if not reloading and Tac.fightForZone and Tac.fightForZone(state, now, dist) then return end
+
 		--  [23/09 noche] Sigiloso: si la presa no lo ha visto y todavia esta
 		--  lejos, no dispara (se delataria): sigue acercandose por la espalda.
 		local myRole = state.meta.role
@@ -2079,6 +2083,9 @@ local function decideMovement(state, now)
 	--  [fase 2 / 24/09] Un companero en el suelo: ir a levantarlo (antes que
 	--  perseguir a nadie), desde una posicion razonable.
 	if Tac.seekRevive(state, now) then return end
+
+	--  [26/09] Control: al area y a quedarse adentro.
+	if Tac.playObjective and Tac.playObjective(state, now) then return end
 
 	--  [IA v3] Esperando abajo al que se subio donde no se puede llegar.
 	if Tac.ambushStep and Tac.ambushStep(state, now) then return end
@@ -2690,6 +2697,7 @@ end
 Tac.combatKinds = {
 	chase = true, search = true, noise = true, intel = true, support = true, order = true,
 	sneak = true, flee = true, cover = true, revive = true, crawl = true, leadercover = true,
+	zone = true,		-- [26/09] Control: ir al area
 }
 
 --  Ir a un punto, recalculando el camino cada 'every' segundos.
@@ -5776,6 +5784,7 @@ end
 function Tac.considerPeek(state, now, target, dist)
 	local AI = Tac.AI
 	if AI.PeekChance <= 0 or state.peek or state.cover or now < (state.nextPeekTry or 0) then return false end
+	if Tac.controlZone() then return false end		-- [26/09] en Control se pelea en el area
 	local role = state.meta.role
 	local kind = role and role.Kind
 	if kind == "Corredora" or kind == "Sigiloso" then return false end
@@ -5875,6 +5884,143 @@ function Tac.startAmbush(state, now, spot)
 	if not best then return false end
 	state.ambush = { pos = best.pos, look = spot, untilT = now + state.rng:NextNumber(8, 15), peek = best.peek, arrived = false }
 	dprint(state.bot.Name, "no puede llegar hasta ahi: lo espera donde lo ve")
+	return true
+end
+
+-- --------------------------------------------------------------------------
+--  CONTROL [26/09]: jugar el punto (AreaObjetivo)
+--
+--  Mientras se juega Control, el RoundManager publica la pieza del area en
+--  State.ControlArea. Fuera de pelea los bots van al area y se quedan
+--  adentro, repartidos y mirando hacia donde puede venir el enemigo.
+--  Peleando: adentro no salen a perseguir (se mueven de lado sin salir);
+--  de afuera van hacia el area disparando. Sumar puntos es estar ahi.
+-- --------------------------------------------------------------------------
+function Tac.controlZone()
+	local now = os.clock()
+	if Tac.zoneAt and now - Tac.zoneAt < 0.5 then return Tac.zone end
+	Tac.zoneAt = now
+	local value = roundState:FindFirstChild("ControlArea")
+	local part = value and value:IsA("ObjectValue") and value.Value
+	if part and part.Parent and part:IsA("BasePart") and roundState:GetAttribute("ActiveGamemode") == "Control" then
+		Tac.zone = part
+	else
+		Tac.zone = nil
+	end
+	return Tac.zone
+end
+
+--  Ejes de la pieza: el que apunta hacia arriba y los dos de la huella.
+function Tac.zoneAxes(zone)
+	local cframe = zone.CFrame
+	local x, y, z = math.abs(cframe.RightVector.Y), math.abs(cframe.UpVector.Y), math.abs(cframe.LookVector.Y)
+	local up = (x >= y and x >= z) and 1 or (y >= z and 2 or 3)
+	local round = zone:IsA("Part") and (zone.Shape == Enum.PartType.Ball or (zone.Shape == Enum.PartType.Cylinder and up == 1))
+	return up, up == 1 and 2 or 1, up == 3 and 2 or 3, round
+end
+
+--  La raiz de un personaje dentro del area (mismo criterio que el
+--  RoundManager); margin = cuanto mas adentro de los bordes.
+function Tac.inZone(zone, position, margin)
+	local cframe, half = zone.CFrame, zone.Size / 2
+	local up, a, b, round = Tac.zoneAxes(zone)
+	local relative = cframe:PointToObjectSpace(position)
+	local coords = { relative.X, relative.Y, relative.Z }
+	local halves = { half.X, half.Y, half.Z }
+	local dy = position.Y - cframe.Position.Y
+	if dy < -halves[up] - 1 or dy > halves[up] + 8 then return false end
+	local ha, hb = math.max(halves[a] - (margin or 0), 0.3), math.max(halves[b] - (margin or 0), 0.3)
+	if round then
+		local radius = math.min(ha, hb)
+		return coords[a] * coords[a] + coords[b] * coords[b] <= radius * radius
+	end
+	return math.abs(coords[a]) <= ha and math.abs(coords[b]) <= hb
+end
+
+--  Un lugar al azar dentro del area, sobre el piso (cada bot el suyo:
+--  repartidos no se amontonan en el centro).
+function Tac.zoneSpot(state, zone)
+	local cframe, half = zone.CFrame, zone.Size / 2
+	local up, a, b, round = Tac.zoneAxes(zone)
+	local halves = { half.X, half.Y, half.Z }
+	local params = Tac.moveParams
+	params.FilterDescendantsInstances = Tac.worldFilter()
+	for _ = 1, 8 do
+		local u, v = state.rng:NextNumber(-1, 1), state.rng:NextNumber(-1, 1)
+		if not round or u * u + v * v <= 1 then
+			local coords = { 0, 0, 0 }
+			coords[a] = u * math.max(halves[a] - 2, 0.5)
+			coords[b] = v * math.max(halves[b] - 2, 0.5)
+			local point = cframe:PointToWorldSpace(Vector3.new(coords[1], coords[2], coords[3]))
+			local hit = workspace:Raycast(point + Vector3.new(0, 2, 0), Vector3.new(0, -(halves[up] + 10), 0), params)
+			if hit and hit.Normal.Y > 0.6 and Tac.inZone(zone, hit.Position + Vector3.new(0, 3, 0), 1)
+				and not Tac.isUnreachable(hit.Position) then
+				return hit.Position
+			end
+		end
+	end
+	return nil
+end
+
+--  Fuera de pelea: al area y a quedarse adentro. true = se hizo cargo.
+function Tac.playObjective(state, now)
+	local zone = Tac.controlZone()
+	if not zone then
+		state.zoneSpot = nil
+		return false
+	end
+	local root = state.root.Position
+	local spot = state.zoneSpot
+	if not spot or now > (state.zoneSpotUntil or 0) then
+		spot = Tac.zoneSpot(state, zone) or Vector3.new(zone.Position.X, root.Y - 3, zone.Position.Z)
+		state.zoneSpot = spot
+		state.zoneSpotUntil = now + state.rng:NextNumber(8, 16)
+	end
+	local inside = Tac.inZone(zone, root, 0.5)
+	if inside and flat(spot - root).Magnitude < 3 then
+		if state.moveMode ~= "hold" then stopWalking(state) end
+		local threat = Tac.threatGuess(state, now)
+		if threat then
+			state.lookAt = threat
+			state.lookUntil = now + 0.5
+		end
+		return true
+	end
+	Tac.goTo(state, now, spot, "zone", inside and WALK_SPEED or RUN_SPEED, 2)
+	if state.pathFails >= 3 then
+		state.zoneSpot = nil
+		state.pathFails = 0
+	end
+	return true
+end
+
+--  Peleando en Control (lejos del enemigo). true = se hizo cargo.
+function Tac.fightForZone(state, now, dist)
+	local zone = Tac.controlZone()
+	if not zone or dist <= 10 then return false end
+	local root = state.root.Position
+	if Tac.inZone(zone, root, 0.5) then
+		--  Adentro: dispara sin salir; de lado solo si sigue adentro.
+		if state.moveMode == "path" or state.moveMode == "direct"
+			or (state.moveMode == "strafe" and state.strafeDir and not Tac.inZone(zone, root + state.strafeDir * 4, 0.5)) then
+			stopWalking(state)
+		end
+		if now >= state.nextDecisionAt then
+			state.nextDecisionAt = now + rangeNumber(state.rng, Config.Movement.StrafeTime)
+			local side = state.root.CFrame.RightVector * (state.rng:NextNumber() < 0.5 and -1 or 1)
+			if state.rng:NextNumber() < 0.5 and Tac.inZone(zone, root + side * 5, 0.5) then
+				startStrafe(state, now, side)
+			elseif state.rng:NextNumber() < Tac.AI.CombatCrouchChance then
+				state.crouchUntil = now + state.rng:NextNumber(0.7, 1.6)
+			end
+		end
+		return true
+	end
+	--  Afuera: hacia el area, disparando en el camino.
+	local spot = state.zoneSpot or Tac.zoneSpot(state, zone)
+	if not spot then return false end
+	state.zoneSpot = spot
+	Tac.goTo(state, now, spot, "zone", Config.Movement.CombatSpeed, 1.5)
 	return true
 end
 

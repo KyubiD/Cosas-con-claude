@@ -29,6 +29,9 @@
 --    · resetPlayerForLobby() hacia Health = 0 y LoadCharacter() casi en el
 --      mismo frame, sin guard: dos llamadas seguidas podian cargar dos
 --      personajes. Reusa el guard RoundCharacterLoading que ya existia.
+--
+--  [26/09/2026] Mapa Prision (con sus spawns Spawn_Prision) y modo de juego
+--  Control (mantener el AreaObjetivo del mapa; ver la seccion CONTROL).
 --==========================================================================
 
 local DEBUG = false
@@ -182,6 +185,22 @@ end
 --  atributo suelto: si solo estuvieran en el atributo, salir con M y
 --  volver a entrar te las resetearia.
 --==========================================================================
+--  [26/09/2026] CONTROL: reglas por defecto (si GamemodeConfig no trae el
+--  modo, se agrega con estas). El resto de la seccion esta mas abajo.
+local Control = { part = nil, scores = {}, saved = nil }
+Control.DEFAULT_RULES = {
+	Label = "Control",
+	Duration = 600,				-- 10 min
+	Lives = 0,					-- reaparicion normal
+	JoinWindow = 0,
+	ForceTeams = "2 Teams",		-- por equipos: si la votacion dio FFA, 2 equipos
+	RequiresPart = "AreaObjetivo",	-- sin esta pieza en el mapa se juega Arcade
+	Control = {
+		PointsPerSecond = 1,	-- por cada jugador de ventaja dentro del area
+		ScoreLimit = 0,			-- > 0: gana el primero que llega (0 = solo tiempo)
+	},
+}
+
 --  [22/09/2026] Las reglas viven ahora en ReplicatedStorage.GamemodeConfig
 --  (las lee tambien DownedServer para Ejecucion). Esta tabla es solo el
 --  respaldo por si el modulo no carga.
@@ -217,6 +236,11 @@ do
 		warn("[RoundManager] Falta GamemodeConfig: solo Arcade y Eliminacion con reglas de respaldo")
 	end
 end
+--  [26/09] Control entra a la lista de modos aunque GamemodeConfig todavia
+--  no lo tenga (la tabla del modulo es la misma para todos los scripts del
+--  servidor, asi DownedServer / CorpseServer / BotServer tambien lo ven).
+if not GAMEMODE_RULES.Control then GAMEMODE_RULES.Control = Control.DEFAULT_RULES end
+if not table.find(gamemodes, "Control") then table.insert(gamemodes, "Control") end
 
 local function rulesFor(name)
 	return GAMEMODE_RULES[name] or GAMEMODE_RULES[DEFAULT_GAMEMODE]
@@ -232,6 +256,7 @@ local mapAliases = {
 	Plaza = "Plaza",
 	Brutalist = "Brutalist",
 	TestMap = "TestMap",
+	Prision = "Prision",		-- [26/09]
 }
 local forcedMapNames = {
 	Metro = "Subterraneo",
@@ -239,6 +264,7 @@ local forcedMapNames = {
 	Brutalist = "Brutalist",
 	["Führer house"] = "Casa",
 	TestMap = "TestMap",
+	Prision = "Prision",		-- [26/09]
 }
 local phase = "Lobby"
 local mapVotes = {}
@@ -459,19 +485,19 @@ local function displayMapName(name)
 end
 
 local function getMapSource()
-	if ServerStorage:FindFirstChild("Metro") or ServerStorage:FindFirstChild("Plaza") or ServerStorage:FindFirstChild("Brutalist") or ServerStorage:FindFirstChild("TestMap") then
+	if ServerStorage:FindFirstChild("Metro") or ServerStorage:FindFirstChild("Plaza") or ServerStorage:FindFirstChild("Brutalist") or ServerStorage:FindFirstChild("TestMap") or ServerStorage:FindFirstChild("Prision") then
 		return ServerStorage
 	end
-	if serverMaps and (serverMaps:FindFirstChild("Metro") or serverMaps:FindFirstChild("Plaza") or serverMaps:FindFirstChild("Brutalist") or serverMaps:FindFirstChild("TestMap")) then
+	if serverMaps and (serverMaps:FindFirstChild("Metro") or serverMaps:FindFirstChild("Plaza") or serverMaps:FindFirstChild("Brutalist") or serverMaps:FindFirstChild("TestMap") or serverMaps:FindFirstChild("Prision")) then
 		return serverMaps
 	end
 	if workspaceMaps then
-		for _, name in ipairs({"Führer house", "Metro", "Brutalist", "Plaza", "TestMap"}) do
+		for _, name in ipairs({"Führer house", "Metro", "Brutalist", "Plaza", "TestMap", "Prision"}) do
 			if workspaceMaps:FindFirstChild(name) then return workspaceMaps end
 		end
 		if workspaceMaps:FindFirstChild("Map_1") then return workspaceMaps end
 	end
-	if Workspace:FindFirstChild("Führer house") or Workspace:FindFirstChild("Metro") or Workspace:FindFirstChild("Brutalist") or Workspace:FindFirstChild("Plaza") or Workspace:FindFirstChild("TestMap") then
+	if Workspace:FindFirstChild("Führer house") or Workspace:FindFirstChild("Metro") or Workspace:FindFirstChild("Brutalist") or Workspace:FindFirstChild("Plaza") or Workspace:FindFirstChild("TestMap") or Workspace:FindFirstChild("Prision") then
 		return Workspace
 	end
 	return serverMaps or workspaceMaps
@@ -481,7 +507,7 @@ local function scanMaps()
 	local source = getMapSource()
 	local result = {}
 	if not source then return result end
-	for _, name in ipairs({"Führer house", "Metro", "Brutalist", "Plaza", "TestMap"}) do
+	for _, name in ipairs({"Führer house", "Metro", "Brutalist", "Plaza", "TestMap", "Prision"}) do
 		if source:FindFirstChild(name) then table.insert(result, name) end
 	end
 	if #result == 0 then
@@ -727,7 +753,8 @@ local function getMapBasePosition(map)
 end
 
 local function getDesignedMapSpawns(map)
-	local prefix = map.Name == "Führer house" and "Spawn_Casa" or map.Name == "Metro" and "Spawn_Subterraneo" or map.Name == "Brutalist" and "Spawn_Brutalist" or (map.Name == "Brutalist" or map.Name == "Plaza") and "Spawn_Plaza" or map.Name == "TestMap" and "Spawn_TestMap" or nil
+	local prefix = map.Name == "Führer house" and "Spawn_Casa" or map.Name == "Metro" and "Spawn_Subterraneo" or map.Name == "Brutalist" and "Spawn_Brutalist" or (map.Name == "Brutalist" or map.Name == "Plaza") and "Spawn_Plaza" or map.Name == "TestMap" and "Spawn_TestMap"
+		or map.Name == "Prision" and "Spawn_Prision" or nil		-- [26/09]
 	if not prefix then return {} end
 	local parts = {}
 	for _, item in ipairs(map:GetDescendants()) do
@@ -1164,6 +1191,263 @@ function Guardian.pickLeaders()
 	Guardian.publishStandings()
 end
 
+--==========================================================================
+--  [26/09/2026] CONTROL: mantener el AreaObjetivo
+--
+--  Solo en mapas con una pieza "AreaObjetivo" (hoy: Prision). Cada segundo
+--  se cuenta quien esta parado en el area (vivo, en la ronda, no abatido;
+--  jugadores y bots igual) y cada enemigo anula a uno:
+--    · el equipo con mas gente suma (los suyos - los de todos los demas)
+--      puntos por segundo: 2 Rojo + 1 Azul = Rojo suma 1;
+--    · si nadie supera a los demas (1 contra 1, 2 contra 2, 2 contra 1+1)
+--      el punto queda en disputa: nadie suma y el area toma la mezcla de
+--      los colores de los que estan adentro.
+--  Gana el equipo con mas puntos al acabarse el tiempo (o el primero en
+--  llegar a ScoreLimit, si esta puesto).
+--  Se publica en State: ControlScore_<Equipo>, ControlHolder (equipo que
+--  suma, "Disputa" o "") y ControlArea (ObjectValue con la pieza: BotServer
+--  lo usa para que los bots jueguen el punto). Al terminar: ControlWinner y
+--  TeamStanding_<Equipo> = puntos (para el podio).
+--==========================================================================
+Control.TEAMS = { "Rojo", "Azul", "Verde", "Amarillo" }
+
+function Control.teamColor(teamName)
+	local team = teamByName[teamName]
+	return team and team.TeamColor.Color or Color3.fromRGB(200, 200, 200)
+end
+
+--  El eje de la pieza que apunta hacia arriba (1 = X, 2 = Y, 3 = Z).
+function Control.upAxis(cframe)
+	local x, y, z = math.abs(cframe.RightVector.Y), math.abs(cframe.UpVector.Y), math.abs(cframe.LookVector.Y)
+	if x >= y and x >= z then return 1 end
+	return y >= z and 2 or 3
+end
+
+--  Un punto (la raiz de un personaje) dentro del area: la huella de la
+--  pieza (caja, o circulo si es una bola / un cilindro parado) y en altura
+--  desde su base hasta 8 studs arriba de su tapa (una pieza fina en el piso
+--  cuenta como toda la zona que tiene encima).
+function Control.contains(part, position)
+	local cframe, half = part.CFrame, part.Size / 2
+	local local3 = cframe:PointToObjectSpace(position)
+	local coords = { local3.X, local3.Y, local3.Z }
+	local halves = { half.X, half.Y, half.Z }
+	local up = Control.upAxis(cframe)
+	local a, b = up == 1 and 2 or 1, up == 3 and 2 or 3
+	local top = halves[up]
+	local dy = position.Y - cframe.Position.Y
+	if dy < -top - 1 or dy > top + 8 then return false end
+	local round = part:IsA("Part") and (part.Shape == Enum.PartType.Ball or (part.Shape == Enum.PartType.Cylinder and up == 1))
+	if round then
+		local radius = math.min(halves[a], halves[b])
+		return coords[a] * coords[a] + coords[b] * coords[b] <= radius * radius
+	end
+	return math.abs(coords[a]) <= halves[a] and math.abs(coords[b]) <= halves[b]
+end
+
+--  Quien suma: counts[equipo] = jugadores dentro. Devuelve (equipo, puntos
+--  de ventaja), ("Disputa", 0) o (nil, 0) si no hay nadie.
+function Control.resolve(counts)
+	local total, best, bestTeam = 0, 0, nil
+	for teamName, count in pairs(counts) do
+		total += count
+		if count > best then best, bestTeam = count, teamName end
+	end
+	if total == 0 then return nil, 0 end
+	local margin = best - (total - best)
+	if margin > 0 then return bestTeam, margin end
+	return "Disputa", 0
+end
+
+function Control.publish(holder)
+	for _, teamName in ipairs(Control.TEAMS) do
+		state:SetAttribute("ControlScore_" .. teamName, Control.scores[teamName])
+	end
+	state:SetAttribute("ControlHolder", holder)
+	local label = Control.label
+	if label and label.Parent then
+		local parts = {}
+		for _, teamName in ipairs(Control.TEAMS) do
+			local score = Control.scores[teamName]
+			if score then
+				table.insert(parts, string.format('<font color="#%s">%s %d</font>', Control.teamColor(teamName):ToHex(), teamName, score))
+			end
+		end
+		local status = holder == "Disputa" and "EN DISPUTA" or holder and holder ~= "" and ("DOMINA " .. string.upper(holder)) or "LIBRE"
+		label.Text = "<b>CONTROL · " .. status .. "</b>\n" .. table.concat(parts, "   ")
+	end
+end
+
+--  Arranca con la ronda: marcador en 0 para cada equipo, el area a la vista
+--  (con su marcador flotante) y la pieza publicada para los bots.
+function Control.start(map)
+	Control.stop(true)
+	local part = map and map:FindFirstChild("AreaObjetivo", true)
+	if not part or not part:IsA("BasePart") then
+		warn("[RoundManager] Control sin AreaObjetivo en " .. tostring(map and map.Name))
+		return
+	end
+	Control.part = part
+	Control.saved = { Color = part.Color, Transparency = part.Transparency }
+	part.Transparency = math.min(part.Transparency, 0.6)
+	for _, teamName in ipairs(getRoundTeamNames(currentMode)) do
+		if teamName ~= "Neutral" then Control.scores[teamName] = 0 end
+	end
+
+	local board = Instance.new("BillboardGui")
+	board.Name = "ControlMarcador"
+	board.Size = UDim2.fromOffset(260, 56)
+	board.StudsOffsetWorldSpace = Vector3.new(0, part.Size.Y / 2 + 9, 0)
+	board.AlwaysOnTop = true
+	board.MaxDistance = 1000
+	board.LightInfluence = 0
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundColor3 = Color3.new(0, 0, 0)
+	label.BackgroundTransparency = 0.45
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextScaled = true
+	label.RichText = true
+	label.Font = Enum.Font.GothamBold
+	label.Parent = board
+	board.Parent = part
+	Control.board, Control.label = board, label
+
+	--  Mezcla de colores cuando esta en disputa: franjas en la cara de arriba.
+	local up = Control.upAxis(part.CFrame)
+	local vector = up == 1 and part.CFrame.RightVector or up == 2 and part.CFrame.UpVector or part.CFrame.LookVector
+	local faces = { { Enum.NormalId.Right, Enum.NormalId.Left }, { Enum.NormalId.Top, Enum.NormalId.Bottom }, { Enum.NormalId.Front, Enum.NormalId.Back } }
+	local surface = Instance.new("SurfaceGui")
+	surface.Name = "ControlMezcla"
+	surface.Face = vector.Y >= 0 and faces[up][1] or faces[up][2]
+	surface.LightInfluence = 0
+	surface.Enabled = false
+	local stripes = Instance.new("Frame")
+	stripes.Size = UDim2.fromScale(1, 1)
+	stripes.BorderSizePixel = 0
+	stripes.BackgroundColor3 = Color3.new(1, 1, 1)
+	local gradient = Instance.new("UIGradient")
+	gradient.Rotation = 45
+	gradient.Parent = stripes
+	stripes.Parent = surface
+	surface.Parent = part
+	Control.surface, Control.gradient = surface, gradient
+
+	local value = state:FindFirstChild("ControlArea")
+	if not value then
+		value = Instance.new("ObjectValue")
+		value.Name = "ControlArea"
+		value.Parent = state
+	end
+	value.Value = part
+	state:SetAttribute("ControlWinner", nil)
+	Control.publish("")
+	dprint("[RoundManager] Control: area", part:GetFullName())
+end
+
+--  Cada segundo de la ronda.
+function Control.tick(rules)
+	local part = Control.part
+	if not part or not part.Parent then return end
+	local counts = {}
+	for _, player in ipairs(participants()) do
+		local teamName = player:GetAttribute("RoundTeam")
+		if player:GetAttribute("InRound") == true and not eliminatedPlayers[player.UserId]
+			and teamName and Control.scores[teamName] ~= nil then
+			local character = player.Character
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+			local root = character and character:FindFirstChild("HumanoidRootPart")
+			if humanoid and humanoid.Health > 0 and root and (character:GetAttribute("DownedState") or "") == ""
+				and Control.contains(part, root.Position) then
+				counts[teamName] = (counts[teamName] or 0) + 1
+			end
+		end
+	end
+	local holder, margin = Control.resolve(counts)
+	local perSecond = (type(rules.Control) == "table" and tonumber(rules.Control.PointsPerSecond)) or 1
+	if margin > 0 then
+		Control.scores[holder] += margin * perSecond
+	end
+
+	--  Color: el del que suma; en disputa, la mezcla de los que estan.
+	local color = Control.saved.Color
+	local present = {}
+	for _, teamName in ipairs(Control.TEAMS) do
+		if counts[teamName] then table.insert(present, teamName) end
+	end
+	if holder == "Disputa" then
+		local r, g, b = 0, 0, 0
+		for _, teamName in ipairs(present) do
+			local teamColor = Control.teamColor(teamName)
+			r, g, b = r + teamColor.R, g + teamColor.G, b + teamColor.B
+		end
+		color = Color3.new(r / #present, g / #present, b / #present)
+		local keys = {}
+		for index, teamName in ipairs(present) do
+			local teamColor = Control.teamColor(teamName)
+			local from, to = (index - 1) / #present, index / #present
+			table.insert(keys, ColorSequenceKeypoint.new(from, teamColor))
+			table.insert(keys, ColorSequenceKeypoint.new(math.max(to - 0.001, from), teamColor))
+		end
+		keys[#keys] = ColorSequenceKeypoint.new(1, Control.teamColor(present[#present]))
+		if Control.gradient then Control.gradient.Color = ColorSequence.new(keys) end
+	elseif holder then
+		color = Control.teamColor(holder)
+	end
+	part.Color = color
+	if Control.surface then Control.surface.Enabled = holder == "Disputa" end
+	Control.publish(holder or "")
+end
+
+--  Ya gano alguien por puntos (si hay ScoreLimit).
+function Control.limitReached(rules)
+	local limit = type(rules.Control) == "table" and tonumber(rules.Control.ScoreLimit) or 0
+	if not limit or limit <= 0 then return false end
+	for _, score in pairs(Control.scores) do
+		if score >= limit then return true end
+	end
+	return false
+end
+
+--  Fin de la ronda: ganador y podio. Los puntos quedan publicados hasta el
+--  ciclo siguiente (el podio los lee justo despues).
+function Control.finish()
+	local winner, best, tie = nil, -1, false
+	for teamName, score in pairs(Control.scores) do
+		state:SetAttribute("TeamStanding_" .. teamName, score)
+		if score > best then
+			winner, best, tie = teamName, score, false
+		elseif score == best then
+			tie = true
+		end
+	end
+	state:SetAttribute("ControlWinner", winner and not tie and winner or "Empate")
+	dprint("[RoundManager] Control: termina | ganador", winner, tie and "(empate)" or "")
+	Control.stop(false)
+end
+
+--  Deja la pieza como estaba. clearScores: tambien borra el marcador.
+function Control.stop(clearScores)
+	local part = Control.part
+	if part and Control.saved then
+		part.Color = Control.saved.Color
+		part.Transparency = Control.saved.Transparency
+	end
+	if Control.board then Control.board:Destroy() end
+	if Control.surface then Control.surface:Destroy() end
+	Control.part, Control.saved, Control.board, Control.label, Control.surface, Control.gradient = nil, nil, nil, nil, nil, nil
+	local value = state:FindFirstChild("ControlArea")
+	if value then value.Value = nil end
+	state:SetAttribute("ControlHolder", nil)
+	if clearScores then
+		Control.scores = {}
+		for _, teamName in ipairs(Control.TEAMS) do
+			state:SetAttribute("ControlScore_" .. teamName, nil)
+		end
+		state:SetAttribute("ControlWinner", nil)
+	end
+end
+
 local function onRoundDeath(player)
 	if phase ~= "Round" then return end
 	if player:GetAttribute("InRound") ~= true then return end
@@ -1284,6 +1568,9 @@ local function shouldEndRoundEarly(elapsed)
 		end
 		return standing <= 1
 	end
+
+	--  [26/09 Control] Solo termina antes si alguien llego al limite de puntos.
+	if rules.Control then return Control.limitReached(rules) end
 
 	if not rules.EndWhenOneLeft then return false end
 	if elapsed < (rules.GraceSeconds or 10) then return false end
@@ -1417,6 +1704,12 @@ local function startRound(mapName, modeName, firstPlayer)
 	--  [22/09 Guardian] Estado limpio, espera de reaparicion del modo, y
 	--  la eleccion de lideres a los PickDelay segundos.
 	Guardian.reset()
+	--  [26/09] Control: marcador y area del mapa.
+	if rulesFor(currentGamemode).Control then
+		Control.start(currentMap)
+	else
+		Control.stop(true)
+	end
 	state:SetAttribute("ModeRespawnDelay", rulesFor(currentGamemode).RespawnDelay)
 	local guardianRules = rulesFor(currentGamemode).Guardian
 	if guardianRules then
@@ -1645,6 +1938,7 @@ local function runRoundCycle()
 	state:SetAttribute("JoinClosesAt", 0)
 	resetTeamLives(false)			-- [22/09] se limpian las del duelo anterior
 	Guardian.reset()				-- [22/09] y el Guardian
+	Control.stop(true)				-- [26/09] y el marcador de Control
 	state:SetAttribute("ModeRespawnDelay", nil)
 	for _, player in ipairs(participants()) do
 		player:SetAttribute("RespawnReadyAt", nil)
@@ -1684,6 +1978,16 @@ local function runRoundCycle()
 	local winningMap = chooseWinner(mapVotes, ballot)
 	local winningMode = chooseWinner(modeVotes, modes)
 	local winningGamemode = chooseWinner(gamemodeVotes, gamemodeOptions) or DEFAULT_GAMEMODE
+	--  [26/09] Un modo que necesita una pieza del mapa (Control: AreaObjetivo)
+	--  no se juega en un mapa que no la tiene: esa partida va en Arcade.
+	local requiredPart = rulesFor(winningGamemode).RequiresPart
+	if requiredPart then
+		local map = winningMap and getMap(winningMap)
+		if not (map and map:FindFirstChild(requiredPart, true)) then
+			dprint("[RoundManager]", winningGamemode, "no se juega en", winningMap, "-> Arcade")
+			winningGamemode = GAMEMODE_RULES.Arcade and "Arcade" or DEFAULT_GAMEMODE
+		end
+	end
 	state:SetAttribute("WinningGamemode", winningGamemode)
 	--  [22/09 Duelo por equipos] Un modo que exige equipos no se juega en
 	--  FFA: si la votacion de EQUIPOS dio FFA pasa a ForceTeams (2 equipos).
@@ -1743,6 +2047,7 @@ local function runRoundCycle()
 				end
 			end
 
+			if rules.Control then Control.tick(rules) end		-- [26/09] 1 vez por segundo
 			if shouldEndRoundEarly(elapsed) then
 				dprint("[RoundManager] Ronda cortada: ya no queda con quien pelear")
 				break
@@ -1752,6 +2057,7 @@ local function runRoundCycle()
 			broadcastState(remaining)
 			task.wait(1)
 		end
+		if rules.Control then Control.finish() end		-- [26/09] ganador y podio
 	end
 end
 
@@ -1778,6 +2084,7 @@ while true do
 	eliminatedPlayers = {}
 	peakRoundPlayers = 0
 	joinClosesClock = 0
+	pcall(Control.stop, false)		-- [26/09] el area vuelve a como estaba
 	pcall(function()
 		state:SetAttribute("ActiveGamemode", "")
 		state:SetAttribute("JoinClosesAt", 0)
@@ -1787,3 +2094,4 @@ while true do
 		end
 	end)
 	task.wait(2)
+end
