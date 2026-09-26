@@ -1706,11 +1706,15 @@ local function startRound(mapName, modeName, firstPlayer)
 	--  la eleccion de lideres a los PickDelay segundos.
 	Guardian.reset()
 	--  [26/09] Control: marcador y area del mapa.
-	if rulesFor(currentGamemode).Control then
-		Control.start(currentMap)
-	else
-		Control.stop(true)
-	end
+	--  (con pcall: si algo del marcador fallara, la ronda arranca igual)
+	local controlOk, controlErr = pcall(function()
+		if rulesFor(currentGamemode).Control then
+			Control.start(currentMap)
+		else
+			Control.stop(true)
+		end
+	end)
+	if not controlOk then warn("[RoundManager] Control no pudo arrancar: " .. tostring(controlErr)) end
 	state:SetAttribute("ModeRespawnDelay", rulesFor(currentGamemode).RespawnDelay)
 	local guardianRules = rulesFor(currentGamemode).Guardian
 	if guardianRules then
@@ -1939,7 +1943,7 @@ local function runRoundCycle()
 	state:SetAttribute("JoinClosesAt", 0)
 	resetTeamLives(false)			-- [22/09] se limpian las del duelo anterior
 	Guardian.reset()				-- [22/09] y el Guardian
-	Control.stop(true)				-- [26/09] y el marcador de Control
+	pcall(Control.stop, true)		-- [26/09] y el marcador de Control
 	state:SetAttribute("ModeRespawnDelay", nil)
 	for _, player in ipairs(participants()) do
 		player:SetAttribute("RespawnReadyAt", nil)
@@ -2048,7 +2052,10 @@ local function runRoundCycle()
 				end
 			end
 
-			if rules.Control then Control.tick(rules) end		-- [26/09] 1 vez por segundo
+			if rules.Control then
+				local tickOk, tickErr = pcall(Control.tick, rules)		-- [26/09] 1 vez por segundo
+				if not tickOk then warn("[RoundManager] Control: " .. tostring(tickErr)) end
+			end
 			if shouldEndRoundEarly(elapsed) then
 				dprint("[RoundManager] Ronda cortada: ya no queda con quien pelear")
 				break
@@ -2058,7 +2065,7 @@ local function runRoundCycle()
 			broadcastState(remaining)
 			task.wait(1)
 		end
-		if rules.Control then Control.finish() end		-- [26/09] ganador y podio
+		if rules.Control then pcall(Control.finish) end		-- [26/09] ganador y podio
 	end
 end
 
