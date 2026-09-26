@@ -504,12 +504,28 @@ local function getMapSource()
 	return serverMaps or workspaceMaps
 end
 
+--  [26/09] Donde mas se busca un mapa conocido si no esta junto a los
+--  demas (p. ej. Prision suelto en Workspace y el resto en Workspace.Maps).
+--  Solo lugares del Workspace: los mapas se usan en su sitio, no se clonan.
+local KNOWN_MAPS = {"Führer house", "Metro", "Brutalist", "Plaza", "TestMap", "Prision"}
+local function findKnownMap(source, name)
+	local found = source and source:FindFirstChild(name)
+	if found then return found end
+	for _, place in ipairs({Workspace, workspaceMaps}) do		-- (workspaceMaps puede ser nil: va al final)
+		if place ~= source then
+			found = place:FindFirstChild(name)
+			if found and (found:IsA("Model") or found:IsA("Folder")) then return found end
+		end
+	end
+	return nil
+end
+
 local function scanMaps()
 	local source = getMapSource()
 	local result = {}
 	if not source then return result end
-	for _, name in ipairs({"Führer house", "Metro", "Brutalist", "Plaza", "TestMap", "Prision"}) do
-		if source:FindFirstChild(name) then table.insert(result, name) end
+	for _, name in ipairs(KNOWN_MAPS) do
+		if findKnownMap(source, name) then table.insert(result, name) end
 	end
 	if #result == 0 then
 		for _, map in ipairs(source:GetChildren()) do
@@ -603,6 +619,7 @@ end
 
 local function getMap(name)
 	local source = getMapSource()
+	if table.find(KNOWN_MAPS, name) then return findKnownMap(source, name) end
 	return source and source:FindFirstChild(name) or nil
 end
 
@@ -2066,6 +2083,24 @@ local function runRoundCycle()
 			task.wait(1)
 		end
 		if rules.Control then pcall(Control.finish) end		-- [26/09] ganador y podio
+	end
+end
+
+--  [26/09] Aviso en Output de que mapas encontro, para ver rapido si falta
+--  alguno (nombre mal escrito o en otra carpeta).
+do
+	local found = getMaps(true)
+	print("[RoundManager] Mapas en la votacion: " .. table.concat(found, ", "))
+	if not table.find(found, "Prision") then
+		local hint = ""
+		for _, place in pairs({Workspace, ServerStorage, workspaceMaps or Workspace, serverMaps or ServerStorage}) do
+			for _, child in ipairs(place:GetChildren()) do
+				if string.find(string.lower(child.Name), "pris", 1, true) then
+					hint = " Encontre '" .. child.Name .. "' en " .. place:GetFullName() .. ": debe llamarse exactamente 'Prision' y estar en el Workspace (junto a los otros mapas)."
+				end
+			end
+		end
+		warn("[RoundManager] No encontre el mapa 'Prision'." .. hint)
 	end
 end
 
