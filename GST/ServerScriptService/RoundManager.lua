@@ -1356,7 +1356,7 @@ function Control.publish(holder)
 			end
 		end
 		local status = holder == "Disputa" and "EN DISPUTA" or holder and holder ~= "" and ("DOMINA " .. string.upper(holder)) or "LIBRE"
-		label.Text = "<b>CONTROL · " .. status .. "</b>\n" .. table.concat(parts, "   ")
+		label.Text = "<b>OBJETIVO · " .. status .. "</b>\n" .. table.concat(parts, "   ")
 	end
 end
 
@@ -1378,9 +1378,10 @@ function Control.buildBorder(part)
 	local model = Instance.new("Model")
 	model.Name = "ControlBorde"
 	local upVector, aVector, bVector, top, halfA, halfB = Control.axes(part)
-	--  A que altura: si el area es una placa fina, sobre su tapa; si es una
+	--  A que altura: si el area es una placa fina, sobre su tapa. Si es una
 	--  caja alta (un volumen donde uno se para ADENTRO), en el piso que tiene
-	--  debajo, no en su tapa (quedaba en el techo o flotando en el aire).
+	--  adentro: se busca desde el CENTRO hacia abajo (desde la tapa se topaba
+	--  con el techo del edificio y los bordes quedaban arriba del techo).
 	local center = part.Position + upVector * (top + 0.15)
 	if top > 1.25 then
 		local params = RaycastParams.new()
@@ -1390,24 +1391,27 @@ function Control.buildBorder(part)
 			if player.Character then table.insert(ignore, player.Character) end
 		end
 		params.FilterDescendantsInstances = ignore
-		local hit = Workspace:Raycast(part.Position + upVector * top, -upVector * (top * 2 + 30), params)
+		local hit = Workspace:Raycast(part.Position, -upVector * (top + 30), params)
 		local floor = hit and (hit.Position - part.Position):Dot(upVector) or -top
-		center = part.Position + upVector * (math.max(floor, -top - 30) + 0.15)
+		center = part.Position + upVector * (math.max(floor, -top - 30) + 0.1)
 	end
-	local thick, postHeight = 0.6, 9
-	local function piece(size, cframe)
+	local thick, postHeight, wallHeight = 0.6, 10, 5
+	local function piece(name, size, cframe, material, transparency, shape)
 		local edge = Instance.new("Part")
-		edge.Name = "Borde"
+		edge.Name = name
+		if shape then edge.Shape = shape end
 		edge.Anchored = true
 		edge.CanCollide = false
-		edge.CanQuery = false
+		edge.CanQuery = false			-- no tapa disparos ni la vista de los bots
 		edge.CanTouch = false
 		edge.CastShadow = false
-		edge.Material = Enum.Material.Neon
+		edge.Material = material or Enum.Material.Neon
+		edge.Transparency = transparency or 0
 		edge.Color = Color3.new(1, 1, 1)
 		edge.Size = size
 		edge.CFrame = cframe
 		edge.Parent = model
+		return edge
 	end
 	local round = part:IsA("Part") and (part.Shape == Enum.PartType.Ball
 		or (part.Shape == Enum.PartType.Cylinder and Control.upAxis(part.CFrame) == 1))
@@ -1415,39 +1419,56 @@ function Control.buildBorder(part)
 	if round then
 		local radius = math.min(halfA, halfB)
 		local segments = 32
+		local length = radius * math.pi * 2 / segments * 1.08
 		for i = 0, segments - 1 do
 			local angle = i / segments * math.pi * 2
 			local out = aVector * math.cos(angle) + bVector * math.sin(angle)
 			local tangent = -aVector * math.sin(angle) + bVector * math.cos(angle)
-			piece(Vector3.new(radius * math.pi * 2 / segments * 1.08, thick, thick),
-				CFrame.fromMatrix(center + out * radius, tangent, upVector))
-			if i % (segments / 4) == 0 then table.insert(corners, center + out * radius) end
+			local at = center + out * radius
+			piece("Borde", Vector3.new(length, thick, thick), CFrame.fromMatrix(at, tangent, upVector))
+			piece("Pared", Vector3.new(length, wallHeight, 0.2), CFrame.fromMatrix(at + upVector * (wallHeight / 2), tangent, upVector),
+				Enum.Material.ForceField, 0)
+			if i % (segments / 4) == 0 then table.insert(corners, at) end
 		end
+		--  Piso de color: un disco (cilindro acostado sobre su eje).
+		piece("Piso", Vector3.new(0.2, radius * 2, radius * 2), CFrame.fromMatrix(center, upVector, aVector),
+			Enum.Material.Neon, 0.65, Enum.PartType.Cylinder)
 	else
-		piece(Vector3.new(halfA * 2 + thick, thick, thick), CFrame.fromMatrix(center + bVector * halfB, aVector, upVector))
-		piece(Vector3.new(halfA * 2 + thick, thick, thick), CFrame.fromMatrix(center - bVector * halfB, aVector, upVector))
-		piece(Vector3.new(halfB * 2 + thick, thick, thick), CFrame.fromMatrix(center + aVector * halfA, bVector, upVector))
-		piece(Vector3.new(halfB * 2 + thick, thick, thick), CFrame.fromMatrix(center - aVector * halfA, bVector, upVector))
+		local sides = {
+			{ center + bVector * halfB, aVector, halfA * 2 }, { center - bVector * halfB, aVector, halfA * 2 },
+			{ center + aVector * halfA, bVector, halfB * 2 }, { center - aVector * halfA, bVector, halfB * 2 },
+		}
+		for _, side in ipairs(sides) do
+			local at, along, length = side[1], side[2], side[3]
+			piece("Borde", Vector3.new(length + thick, thick, thick), CFrame.fromMatrix(at, along, upVector))
+			piece("Pared", Vector3.new(length, wallHeight, 0.2), CFrame.fromMatrix(at + upVector * (wallHeight / 2), along, upVector),
+				Enum.Material.ForceField, 0)
+		end
 		for _, sa in ipairs({ -1, 1 }) do
 			for _, sb in ipairs({ -1, 1 }) do
 				table.insert(corners, center + aVector * halfA * sa + bVector * halfB * sb)
 			end
 		end
+		piece("Piso", Vector3.new(halfA * 2, 0.2, halfB * 2), CFrame.fromMatrix(center, aVector, upVector), Enum.Material.Neon, 0.65)
 	end
 	for _, corner in ipairs(corners) do
-		piece(Vector3.new(thick, postHeight, thick), CFrame.fromMatrix(corner + upVector * (postHeight / 2), aVector, upVector))
+		piece("Poste", Vector3.new(thick, postHeight, thick), CFrame.fromMatrix(corner + upVector * (postHeight / 2), aVector, upVector))
 	end
-	--  Y un contorno (Highlight) de la pieza misma, del mismo color.
+	--  Y un contorno (Highlight) del piso de color, visible a traves de las
+	--  paredes del mapa para encontrar el punto desde lejos.
 	local outline = Instance.new("Highlight")
 	outline.Name = "ControlContorno"
-	outline.Adornee = part
-	outline.FillTransparency = 1
+	outline.Adornee = model
+	outline.FillTransparency = 0.8
 	outline.OutlineTransparency = 0
+	outline.FillColor = Color3.new(1, 1, 1)
 	outline.OutlineColor = Color3.new(1, 1, 1)
-	outline.DepthMode = Enum.HighlightDepthMode.Occluded
+	outline.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
 	outline.Parent = model
-	model.Parent = part.Parent
-	print(string.format("[RoundManager] Control: area '%s' con %d bordes a la altura Y=%.1f", part:GetFullName(), #model:GetChildren() - 1, center.Y))
+	--  Suelto en el Workspace (no dentro del mapa): nada del mapa lo esconde.
+	model.Parent = Workspace
+	print(string.format("[RoundManager] Control: area '%s' marcada (%d piezas) en %s",
+		part:GetFullName(), #model:GetChildren() - 1, tostring(Vector3.new(math.floor(center.X), math.floor(center.Y), math.floor(center.Z)))))
 	return model
 end
 
@@ -1466,6 +1487,7 @@ function Control.colorBorder(holder, present)
 			edge.Color = color
 		elseif edge:IsA("Highlight") then
 			edge.OutlineColor = color
+			edge.FillColor = color
 		end
 	end
 end
@@ -1634,17 +1656,21 @@ function Control.start(map)
 	end
 	Control.part = part
 	Control.saved = { Color = part.Color, Transparency = part.Transparency }
-	part.Transparency = math.min(part.Transparency, 0.6)
+	--  Placa fina: se ve de color. Caja alta: queda como estaba (la marcan el
+	--  piso de color, las paredes y los postes; una caja de color tapaba todo).
+	if select(4, Control.axes(part)) <= 1.25 then
+		part.Transparency = math.min(part.Transparency, 0.6)
+	end
 	for _, teamName in ipairs(getRoundTeamNames(currentMode)) do
 		if teamName ~= "Neutral" then Control.scores[teamName] = 0 end
 	end
 
 	local board = Instance.new("BillboardGui")
 	board.Name = "ControlMarcador"
-	board.Size = UDim2.fromOffset(260, 56)
+	board.Size = UDim2.fromOffset(300, 64)
 	board.StudsOffsetWorldSpace = Vector3.new(0, part.Size.Y / 2 + 9, 0)
 	board.AlwaysOnTop = true
-	board.MaxDistance = 1000
+	board.MaxDistance = math.huge		-- se ve desde cualquier parte del mapa
 	board.LightInfluence = 0
 	local label = Instance.new("TextLabel")
 	label.Size = UDim2.fromScale(1, 1)
