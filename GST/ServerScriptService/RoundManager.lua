@@ -1227,6 +1227,66 @@ end
 --  lo usa para que los bots jueguen el punto). Al terminar: ControlWinner y
 --  TeamStanding_<Equipo> = puntos (para el podio).
 --==========================================================================
+--  Busca la pieza del area con tolerancia: nombre sin importar mayusculas,
+--  espacios, guiones bajos ni acentos ("Area Objetivo", "areaobjetivo",
+--  "ÁreaObjetivo"...). Primero dentro del mapa; si no esta, una suelta en el
+--  Workspace que no sea de otro mapa. Si es un Model, usa su parte mas grande.
+--  Devuelve la pieza (o nil) y un texto con el motivo para Output.
+function Control.normalize(name)
+	name = string.lower(name)
+	for from, to in pairs({ ["á"] = "a", ["é"] = "e", ["í"] = "i", ["ó"] = "o", ["ú"] = "u", ["Á"] = "a", ["É"] = "e", ["Í"] = "i", ["Ó"] = "o", ["Ú"] = "u" }) do
+		name = string.gsub(name, from, to)
+	end
+	return (string.gsub(name, "[%s_%-]", ""))
+end
+
+function Control.asPart(item)
+	if item:IsA("BasePart") then return item end
+	local best, bestVolume = nil, -1
+	for _, child in ipairs(item:GetDescendants()) do
+		if child:IsA("BasePart") then
+			local volume = child.Size.X * child.Size.Y * child.Size.Z
+			if volume > bestVolume then best, bestVolume = child, volume end
+		end
+	end
+	return best
+end
+
+function Control.findArea(map, partName)
+	partName = partName or "AreaObjetivo"
+	if not map then return nil, "no encontre el mapa" end
+	local exact = map:FindFirstChild(partName, true)
+	if exact and Control.asPart(exact) then return Control.asPart(exact), "ok" end
+	local wanted = Control.normalize(partName)
+	for _, item in ipairs(map:GetDescendants()) do
+		if Control.normalize(item.Name) == wanted and Control.asPart(item) then
+			return Control.asPart(item), "ok (se llama '" .. item.Name .. "')"
+		end
+	end
+	--  Suelta en el Workspace (fuera del modelo del mapa), pero no de otro mapa.
+	for _, item in ipairs(Workspace:GetDescendants()) do
+		if Control.normalize(item.Name) == wanted and Control.asPart(item) then
+			local ofOther = false
+			for _, name in ipairs(KNOWN_MAPS) do
+				local other = getMap(name)
+				if other and other ~= map and item:IsDescendantOf(other) then ofOther = true break end
+			end
+			--  y tiene que estar encima del mapa (si no, Metro "encontraria" el
+			--  area suelta de Prision).
+			if not ofOther and map:IsA("Model") then
+				local boxCFrame, boxSize = map:GetBoundingBox()
+				local localPos = boxCFrame:PointToObjectSpace(Control.asPart(item).Position)
+				local half = boxSize / 2 + Vector3.new(10, 10, 10)
+				if math.abs(localPos.X) <= half.X and math.abs(localPos.Y) <= half.Y and math.abs(localPos.Z) <= half.Z then
+					return Control.asPart(item), "ok (esta fuera del modelo del mapa, en " .. item:GetFullName() .. ")"
+				end
+			end
+		end
+	end
+	if exact then return nil, "'" .. partName .. "' existe pero es " .. exact.ClassName .. " sin partes adentro" end
+	return nil, "no hay ninguna pieza '" .. partName .. "' dentro de " .. map:GetFullName()
+end
+
 Control.TEAMS = { "Rojo", "Azul", "Verde", "Amarillo" }
 
 function Control.teamColor(teamName)
@@ -1300,9 +1360,9 @@ end
 --  (con su marcador flotante) y la pieza publicada para los bots.
 function Control.start(map)
 	Control.stop(true)
-	local part = map and map:FindFirstChild("AreaObjetivo", true)
-	if not part or not part:IsA("BasePart") then
-		warn("[RoundManager] Control sin AreaObjetivo en " .. tostring(map and map.Name))
+	local part, why = Control.findArea(map, "AreaObjetivo")
+	if not part then
+		warn("[RoundManager] Control sin AreaObjetivo en " .. tostring(map and map.Name) .. ": " .. why)
 		return
 	end
 	Control.part = part
@@ -2005,11 +2065,13 @@ local function runRoundCycle()
 	local requiredPart = rulesFor(winningGamemode).RequiresPart
 	if requiredPart then
 		local map = winningMap and getMap(winningMap)
-		if not (map and map:FindFirstChild(requiredPart, true)) then
+		local found, area, why = pcall(Control.findArea, map, requiredPart)
+		if not found then area, why = nil, tostring(area) end
+		if not area then
 			--  warn (no dprint): si pasa en un mapa que SI deberia tenerla (Prision),
 			--  en Output se ve que pieza falta.
-			warn(string.format("[RoundManager] %s necesita una pieza '%s' dentro del mapa '%s' y no la encontre -> se juega Arcade",
-				tostring(winningGamemode), tostring(requiredPart), tostring(winningMap)))
+			warn(string.format("[RoundManager] %s en '%s' -> se juega Arcade: %s",
+				tostring(winningGamemode), tostring(winningMap), why))
 			winningGamemode = GAMEMODE_RULES.Arcade and "Arcade" or DEFAULT_GAMEMODE
 		end
 	end
