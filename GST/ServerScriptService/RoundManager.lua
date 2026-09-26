@@ -196,6 +196,7 @@ Control.DEFAULT_RULES = {
 	JoinWindow = 0,
 	ForceTeams = "2 Teams",		-- por equipos: si la votacion dio FFA, 2 equipos
 	RequiresPart = "AreaObjetivo",	-- sin esta pieza en el mapa se juega Arcade
+	KillPoints = false,			-- solo cuentan los puntos del area
 	Control = {
 		PointsPerSecond = 1,	-- por cada jugador de ventaja dentro del area
 		ScoreLimit = 0,			-- > 0: gana el primero que llega (0 = solo tiempo)
@@ -1226,6 +1227,9 @@ end
 --  suma, "Disputa" o "") y ControlArea (ObjectValue con la pieza: BotServer
 --  lo usa para que los bots jueguen el punto). Al terminar: ControlWinner y
 --  TeamStanding_<Equipo> = puntos (para el podio).
+--  Tambien: marcador arriba en pantalla (ControlHud), bordes de neon en el
+--  area (ControlBorde) y puntos por jugador solo del punto (ControlPoints,
+--  y el valor de puntos de leaderstats queda fijo en esos).
 --==========================================================================
 --  Busca la pieza del area con tolerancia: nombre sin importar mayusculas,
 --  espacios, guiones bajos ni acentos ("Area Objetivo", "areaobjetivo",
@@ -1356,6 +1360,240 @@ function Control.publish(holder)
 	end
 end
 
+--  [26/09] BORDES: tiras de neon por el contorno de la tapa del area y
+--  postes en las esquinas, para que se vea de lejos donde esta el punto.
+--  Toman el color del que domina; en disputa van alternando los colores de
+--  los que estan adentro; libre = blanco. No chocan ni tapan disparos.
+function Control.axes(part)
+	local cframe = part.CFrame
+	local vectors = { cframe.RightVector, cframe.UpVector, cframe.LookVector }
+	local up = Control.upAxis(cframe)
+	local a, b = up == 1 and 2 or 1, up == 3 and 2 or 3
+	local upVector = vectors[up].Y >= 0 and vectors[up] or -vectors[up]
+	local sizes = { part.Size.X, part.Size.Y, part.Size.Z }
+	return upVector, vectors[a], vectors[b], sizes[up] / 2, sizes[a] / 2, sizes[b] / 2
+end
+
+function Control.buildBorder(part)
+	local model = Instance.new("Model")
+	model.Name = "ControlBorde"
+	local upVector, aVector, bVector, top, halfA, halfB = Control.axes(part)
+	local center = part.Position + upVector * (top + 0.15)
+	local thick, postHeight = 0.5, 7
+	local function piece(size, cframe)
+		local edge = Instance.new("Part")
+		edge.Name = "Borde"
+		edge.Anchored = true
+		edge.CanCollide = false
+		edge.CanQuery = false
+		edge.CanTouch = false
+		edge.CastShadow = false
+		edge.Material = Enum.Material.Neon
+		edge.Color = Color3.new(1, 1, 1)
+		edge.Size = size
+		edge.CFrame = cframe
+		edge.Parent = model
+	end
+	local round = part:IsA("Part") and (part.Shape == Enum.PartType.Ball
+		or (part.Shape == Enum.PartType.Cylinder and Control.upAxis(part.CFrame) == 1))
+	local corners = {}
+	if round then
+		local radius = math.min(halfA, halfB)
+		local segments = 32
+		for i = 0, segments - 1 do
+			local angle = i / segments * math.pi * 2
+			local out = aVector * math.cos(angle) + bVector * math.sin(angle)
+			local tangent = -aVector * math.sin(angle) + bVector * math.cos(angle)
+			piece(Vector3.new(radius * math.pi * 2 / segments * 1.08, thick, thick),
+				CFrame.fromMatrix(center + out * radius, tangent, upVector))
+			if i % (segments / 4) == 0 then table.insert(corners, center + out * radius) end
+		end
+	else
+		piece(Vector3.new(halfA * 2 + thick, thick, thick), CFrame.fromMatrix(center + bVector * halfB, aVector, upVector))
+		piece(Vector3.new(halfA * 2 + thick, thick, thick), CFrame.fromMatrix(center - bVector * halfB, aVector, upVector))
+		piece(Vector3.new(halfB * 2 + thick, thick, thick), CFrame.fromMatrix(center + aVector * halfA, bVector, upVector))
+		piece(Vector3.new(halfB * 2 + thick, thick, thick), CFrame.fromMatrix(center - aVector * halfA, bVector, upVector))
+		for _, sa in ipairs({ -1, 1 }) do
+			for _, sb in ipairs({ -1, 1 }) do
+				table.insert(corners, center + aVector * halfA * sa + bVector * halfB * sb)
+			end
+		end
+	end
+	for _, corner in ipairs(corners) do
+		piece(Vector3.new(thick, postHeight, thick), CFrame.fromMatrix(corner + upVector * (postHeight / 2), aVector, upVector))
+	end
+	model.Parent = part.Parent
+	return model
+end
+
+function Control.colorBorder(holder, present)
+	local border = Control.border
+	if not border or not border.Parent then return end
+	local color = Color3.new(1, 1, 1)
+	if holder == "Disputa" and #present > 0 then
+		Control.blink = (Control.blink or 0) + 1
+		color = Control.teamColor(present[Control.blink % #present + 1])
+	elseif holder and holder ~= "" then
+		color = Control.teamColor(holder)
+	end
+	for _, edge in ipairs(border:GetChildren()) do
+		if edge:IsA("BasePart") then edge.Color = color end
+	end
+end
+
+--  [26/09] MARCADOR ARRIBA: una ScreenGui que el servidor pone en el
+--  PlayerGui de cada jugador (ResetOnSpawn = false: sobrevive a las
+--  muertes). Solo se ve estando en la ronda. Un recuadro por equipo con sus
+--  puntos (el que domina, con borde blanco) y debajo el estado del punto y
+--  tus puntos.
+function Control.hudFor(player)
+	local playerGui = player:FindFirstChildOfClass("PlayerGui")
+	if not playerGui then return nil end
+	local gui = playerGui:FindFirstChild("ControlHud")
+	if gui then return gui end
+	gui = Instance.new("ScreenGui")
+	gui.Name = "ControlHud"
+	gui.ResetOnSpawn = false
+	gui.DisplayOrder = 5
+	local teamsRow = Instance.new("Frame")
+	teamsRow.Name = "Equipos"
+	teamsRow.AnchorPoint = Vector2.new(0.5, 0)
+	teamsRow.Position = UDim2.new(0.5, 0, 0, 6)
+	teamsRow.Size = UDim2.fromOffset(480, 44)
+	teamsRow.BackgroundTransparency = 1
+	teamsRow.Parent = gui
+	local layout = Instance.new("UIListLayout")
+	layout.FillDirection = Enum.FillDirection.Horizontal
+	layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+	layout.SortOrder = Enum.SortOrder.LayoutOrder
+	layout.Padding = UDim.new(0, 8)
+	layout.Parent = teamsRow
+	for index, teamName in ipairs(Control.TEAMS) do
+		if Control.scores[teamName] then
+			local box = Instance.new("Frame")
+			box.Name = teamName
+			box.LayoutOrder = index
+			box.Size = UDim2.fromOffset(112, 44)
+			box.BackgroundColor3 = Control.teamColor(teamName)
+			box.BackgroundTransparency = 0.25
+			local corner = Instance.new("UICorner")
+			corner.CornerRadius = UDim.new(0, 6)
+			corner.Parent = box
+			local stroke = Instance.new("UIStroke")
+			stroke.Color = Color3.new(1, 1, 1)
+			stroke.Thickness = 0
+			stroke.Parent = box
+			local nameLabel = Instance.new("TextLabel")
+			nameLabel.Name = "Nombre"
+			nameLabel.BackgroundTransparency = 1
+			nameLabel.Size = UDim2.new(1, 0, 0, 14)
+			nameLabel.Position = UDim2.fromOffset(0, 2)
+			nameLabel.Font = Enum.Font.GothamBold
+			nameLabel.TextSize = 12
+			nameLabel.TextColor3 = Color3.new(1, 1, 1)
+			nameLabel.Text = string.upper(teamName)
+			nameLabel.Parent = box
+			local scoreLabel = Instance.new("TextLabel")
+			scoreLabel.Name = "Puntos"
+			scoreLabel.BackgroundTransparency = 1
+			scoreLabel.Size = UDim2.new(1, 0, 0, 26)
+			scoreLabel.Position = UDim2.fromOffset(0, 16)
+			scoreLabel.Font = Enum.Font.GothamBlack
+			scoreLabel.TextSize = 24
+			scoreLabel.TextColor3 = Color3.new(1, 1, 1)
+			scoreLabel.TextStrokeTransparency = 0.5
+			scoreLabel.Text = "0"
+			scoreLabel.Parent = box
+			box.Parent = teamsRow
+		end
+	end
+	local status = Instance.new("TextLabel")
+	status.Name = "Estado"
+	status.AnchorPoint = Vector2.new(0.5, 0)
+	status.Position = UDim2.new(0.5, 0, 0, 54)
+	status.Size = UDim2.fromOffset(360, 20)
+	status.BackgroundTransparency = 1
+	status.Font = Enum.Font.GothamBold
+	status.TextSize = 15
+	status.TextColor3 = Color3.new(1, 1, 1)
+	status.TextStrokeTransparency = 0.4
+	status.RichText = true
+	status.Text = ""
+	status.Parent = gui
+	gui.Parent = playerGui
+	return gui
+end
+
+function Control.updateHud(holder, rules)
+	local limit = type(rules) == "table" and type(rules.Control) == "table" and tonumber(rules.Control.ScoreLimit) or 0
+	local statusText = holder == "Disputa" and "PUNTO EN DISPUTA"
+		or holder and holder ~= "" and ('<font color="#' .. Control.teamColor(holder):ToHex() .. '">DOMINA ' .. string.upper(holder) .. "</font>")
+		or "PUNTO LIBRE"
+	for _, player in ipairs(Players:GetPlayers()) do
+		local gui = Control.hudFor(player)
+		if gui then
+			gui.Enabled = player:GetAttribute("InRound") == true
+			local row = gui:FindFirstChild("Equipos")
+			for teamName, score in pairs(Control.scores) do
+				local box = row and row:FindFirstChild(teamName)
+				if box then
+					box.Puntos.Text = limit > 0 and (tostring(score) .. " / " .. tostring(limit)) or tostring(score)
+					box.UIStroke.Thickness = teamName == holder and 3 or 0
+				end
+			end
+			local mine = Control.playerPoints[player.UserId] or 0
+			gui.Estado.Text = statusText .. "  ·  tus puntos: " .. tostring(mine)
+		end
+	end
+end
+
+function Control.removeHud()
+	for _, player in ipairs(Players:GetPlayers()) do
+		local playerGui = player:FindFirstChildOfClass("PlayerGui")
+		local gui = playerGui and playerGui:FindFirstChild("ControlHud")
+		if gui then gui:Destroy() end
+	end
+end
+
+--  [26/09] PUNTOS DE JUGADOR: en Control solo cuentan los del punto. Cada
+--  segundo que tu equipo suma y tu estas adentro = PointsPerSecond para ti
+--  (atributo ControlPoints). Y en la tabla (leaderstats) el valor de puntos
+--  (Points / Puntos / Score / Puntaje / Pts) queda FIJO en esos puntos: si
+--  otro script le suma por eliminaciones, se devuelve al instante.
+Control.playerPoints = {}
+Control.locks = {}
+Control.STAT_NAMES = { points = true, puntos = true, score = true, puntaje = true, pts = true }
+
+function Control.lockStats(player)
+	if typeof(player) ~= "Instance" then return end
+	local stats = player:FindFirstChild("leaderstats")
+	if not stats then return end
+	for _, value in ipairs(stats:GetChildren()) do
+		if (value:IsA("IntValue") or value:IsA("NumberValue")) and Control.STAT_NAMES[Control.normalize(value.Name)]
+			and not Control.locks[value] then
+			local userId = player.UserId
+			value.Value = Control.playerPoints[userId] or 0
+			Control.locks[value] = value.Changed:Connect(function()
+				local wanted = Control.playerPoints[userId] or 0
+				if value.Value ~= wanted then value.Value = wanted end
+			end)
+		end
+	end
+end
+
+function Control.setPlayerPoints(player, points)
+	Control.playerPoints[player.UserId] = points
+	pcall(function() player:SetAttribute("ControlPoints", points) end)
+	for value in pairs(Control.locks) do
+		if value.Parent and value.Parent.Parent == player then value.Value = points end
+	end
+end
+
+function Control.unlockStats()
+	for _, connection in pairs(Control.locks) do connection:Disconnect() end
+	Control.locks = {}
+end
+
 --  Arranca con la ronda: marcador en 0 para cada equipo, el area a la vista
 --  (con su marcador flotante) y la pieza publicada para los bots.
 function Control.start(map)
@@ -1390,6 +1628,12 @@ function Control.start(map)
 	label.Parent = board
 	board.Parent = part
 	Control.board, Control.label = board, label
+	Control.border = Control.buildBorder(part)
+	Control.playerPoints = {}
+	for _, player in ipairs(participants()) do
+		pcall(function() player:SetAttribute("ControlPoints", 0) end)
+		pcall(Control.lockStats, player)
+	end
 
 	--  Mezcla de colores cuando esta en disputa: franjas en la cara de arriba.
 	local up = Control.upAxis(part.CFrame)
@@ -1420,6 +1664,7 @@ function Control.start(map)
 	value.Value = part
 	state:SetAttribute("ControlWinner", nil)
 	Control.publish("")
+	Control.updateHud("", nil)
 	dprint("[RoundManager] Control: area", part:GetFullName())
 end
 
@@ -1428,7 +1673,9 @@ function Control.tick(rules)
 	local part = Control.part
 	if not part or not part.Parent then return end
 	local counts = {}
+	local inside = {}
 	for _, player in ipairs(participants()) do
+		pcall(Control.lockStats, player)		-- los que entran a mitad de ronda
 		local teamName = player:GetAttribute("RoundTeam")
 		if player:GetAttribute("InRound") == true and not eliminatedPlayers[player.UserId]
 			and teamName and Control.scores[teamName] ~= nil then
@@ -1438,6 +1685,7 @@ function Control.tick(rules)
 			if humanoid and humanoid.Health > 0 and root and (character:GetAttribute("DownedState") or "") == ""
 				and Control.contains(part, root.Position) then
 				counts[teamName] = (counts[teamName] or 0) + 1
+				table.insert(inside, { player = player, team = teamName })
 			end
 		end
 	end
@@ -1445,6 +1693,12 @@ function Control.tick(rules)
 	local perSecond = (type(rules.Control) == "table" and tonumber(rules.Control.PointsPerSecond)) or 1
 	if margin > 0 then
 		Control.scores[holder] += margin * perSecond
+		--  Puntos de cada uno: los del equipo que suma que estan adentro.
+		for _, entry in ipairs(inside) do
+			if entry.team == holder then
+				Control.setPlayerPoints(entry.player, (Control.playerPoints[entry.player.UserId] or 0) + perSecond)
+			end
+		end
 	end
 
 	--  Color: el del que suma; en disputa, la mezcla de los que estan.
@@ -1474,7 +1728,9 @@ function Control.tick(rules)
 	end
 	part.Color = color
 	if Control.surface then Control.surface.Enabled = holder == "Disputa" end
+	Control.colorBorder(holder, present)
 	Control.publish(holder or "")
+	Control.updateHud(holder or "", rules)
 end
 
 --  Ya gano alguien por puntos (si hay ScoreLimit).
@@ -1513,12 +1769,17 @@ function Control.stop(clearScores)
 	end
 	if Control.board then Control.board:Destroy() end
 	if Control.surface then Control.surface:Destroy() end
+	if Control.border then Control.border:Destroy() end
 	Control.part, Control.saved, Control.board, Control.label, Control.surface, Control.gradient = nil, nil, nil, nil, nil, nil
+	Control.border = nil
+	Control.unlockStats()
+	pcall(Control.removeHud)
 	local value = state:FindFirstChild("ControlArea")
 	if value then value.Value = nil end
 	state:SetAttribute("ControlHolder", nil)
 	if clearScores then
 		Control.scores = {}
+		Control.playerPoints = {}
 		for _, teamName in ipairs(Control.TEAMS) do
 			state:SetAttribute("ControlScore_" .. teamName, nil)
 		end

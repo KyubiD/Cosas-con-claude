@@ -45,6 +45,9 @@
 --                      se juega en Arcade (Control necesita AreaObjetivo).
 --    Control           [26/09] (solo Control) puntos por mantener el area,
 --                      ver abajo.
+--    KillPoints        [26/09] false = las eliminaciones (y demas) NO dan
+--                      puntos en este modo. El RoundManager ademas deja fijo
+--                      el valor de puntos de leaderstats en los del modo.
 --
 --  VOTACION: igual que los mapas, en cada votacion salen 3 modos al azar de
 --  los de Order (lo sortea el RoundManager).
@@ -141,6 +144,10 @@ GamemodeConfig.Modes = {
 	--  mezcla de colores). Gana el equipo con mas puntos al acabarse el
 	--  tiempo. El RoundManager publica los puntos en State.ControlScore_<Equipo>
 	--  y, al terminar, TeamStanding_<Equipo> = puntos (de ahi el podio).
+	--  Los puntos de CADA jugador son solo los del punto: PointsPerSecond por
+	--  cada segundo que su equipo suma y el esta adentro (atributo
+	--  ControlPoints, y es lo que muestra la tabla). Arriba sale el marcador
+	--  por equipo y el area lleva bordes de neon del color del que domina.
 	Control = {
 		Label = "CONTROL",
 		Duration = 600,				-- 10 minutos
@@ -151,6 +158,7 @@ GamemodeConfig.Modes = {
 		TeamPodium = true,
 		TeamPodiumBy = "Standing",	-- ordena por TeamStanding_ = puntos de Control
 		RequiresPart = "AreaObjetivo",
+		KillPoints = false,			-- solo cuentan los puntos del area
 		Control = {
 			PointsPerSecond = 1,	-- por cada jugador de ventaja dentro del area
 			ScoreLimit = 0,			-- > 0: gana el primero que llega (0 = solo el tiempo)
