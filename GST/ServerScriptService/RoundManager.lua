@@ -185,8 +185,9 @@ end
 --  atributo suelto: si solo estuvieran en el atributo, salir con M y
 --  volver a entrar te las resetearia.
 --==========================================================================
---  [26/09/2026] CONTROL: reglas por defecto (si GamemodeConfig no trae el
---  modo, se agrega con estas). El resto de la seccion esta mas abajo.
+--  [26/09/2026] CONTROL: reglas de respaldo (las de verdad estan en
+--  GamemodeConfig.Modes.Control; estas solo se usan si el modulo no lo
+--  trae). El resto de la seccion esta mas abajo.
 local Control = { part = nil, scores = {}, saved = nil }
 Control.DEFAULT_RULES = {
 	Label = "Control",

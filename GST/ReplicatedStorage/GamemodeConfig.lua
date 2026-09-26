@@ -40,6 +40,11 @@
 --                      morir O de salir al menu (asi el menu no sirve para
 --                      saltarse la espera). Sin esto, la espera normal.
 --    Guardian          (solo Guardian) lider por equipo, ver abajo.
+--    RequiresPart      [26/09] el mapa tiene que tener una pieza con este
+--                      nombre; si el mapa votado no la tiene, esa partida
+--                      se juega en Arcade (Control necesita AreaObjetivo).
+--    Control           [26/09] (solo Control) puntos por mantener el area,
+--                      ver abajo.
 --
 --  VOTACION: igual que los mapas, en cada votacion salen 3 modos al azar de
 --  los de Order (lo sortea el RoundManager).
@@ -53,7 +58,7 @@ GamemodeConfig.STUDS_PER_METER = 3.5714
 GamemodeConfig.Default = "Arcade"
 
 --  Orden en el que salen en la votacion.
-GamemodeConfig.Order = { "Arcade", "DueloEquipos", "DueloVidas", "Eliminacion", "Ejecucion", "Guardian" }
+GamemodeConfig.Order = { "Arcade", "DueloEquipos", "DueloVidas", "Eliminacion", "Ejecucion", "Guardian", "Control" }
 
 GamemodeConfig.Modes = {
 	Arcade = {
@@ -125,6 +130,30 @@ GamemodeConfig.Modes = {
 			--  Slots (WeaponCategory de LoadoutServer) que NO recibe quien
 			--  no es lider: las armas largas.
 			RestrictedSlots = "2Primary,3Secondary",
+		},
+	},
+
+	--  [26/09/2026] Control: mantener el AreaObjetivo del mapa (hoy solo
+	--  Prision la tiene). Cada segundo se cuenta quien esta parado en el area
+	--  y cada enemigo anula a uno: el equipo con mas gente suma (sus
+	--  jugadores - los de todos los demas) * PointsPerSecond. Si nadie supera
+	--  a los demas, el punto queda en disputa (nadie suma, el area toma la
+	--  mezcla de colores). Gana el equipo con mas puntos al acabarse el
+	--  tiempo. El RoundManager publica los puntos en State.ControlScore_<Equipo>
+	--  y, al terminar, TeamStanding_<Equipo> = puntos (de ahi el podio).
+	Control = {
+		Label = "CONTROL",
+		Duration = 600,				-- 10 minutos
+		Lives = 0,					-- reaparicion normal
+		EndWhenOneLeft = false,
+		JoinWindow = 0,
+		ForceTeams = "2 Teams",
+		TeamPodium = true,
+		TeamPodiumBy = "Standing",	-- ordena por TeamStanding_ = puntos de Control
+		RequiresPart = "AreaObjetivo",
+		Control = {
+			PointsPerSecond = 1,	-- por cada jugador de ventaja dentro del area
+			ScoreLimit = 0,			-- > 0: gana el primero que llega (0 = solo el tiempo)
 		},
 	},
 
