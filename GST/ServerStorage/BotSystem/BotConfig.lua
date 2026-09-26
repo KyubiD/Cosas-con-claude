@@ -453,6 +453,25 @@ BotConfig.SpawnProtection = {
 --    WindowEscapeAfter exploraciones antes de salir por una ventana (2).
 --    PathBudget        calculos de camino por segundo entre todos (14).
 --    LodDistance       sin jugadores reales a esto piensan mas lento (260).
+--
+--  IA v3  [26/09]  (edificios, puertas, memoria del mapa)
+--    DoorWaitMax       s esperando que una puerta abra antes de reintentar
+--                      o darla por cerrada con llave (2.2).
+--    DoorLockedTime    s que una puerta que no abre es pared para los
+--                      caminos; despues se vuelve a probar (60).
+--    MemoryTime        s que todos los bots recuerdan un lugar al que no se
+--                      puede llegar; si vuelve a fallar, el doble (90).
+--    MemoryMax         tope de ese recuerdo (300).
+--    ClimbSearch       studs alrededor de un destino alto sin camino donde
+--                      buscar un borde para trepar (12).
+--    SmartPositions    defensiva / estratega / camper eligen puesto mirando
+--                      todos los pisos: ventanas, azoteas, colinas (true).
+--    PeekChance        peleando de lejos al descubierto, prob. de ir a un
+--                      lugar para asomarse (muro bajo, ventana) (0.55).
+--    PeekMinDistance   mas cerca que esto pelea moviendose (22).
+--    PeekRange         studs a la redonda donde busca ese lugar (22).
+--    OverwatchChance   yendo a un tiroteo lejano, prob. de ir a un lugar
+--                      alto que lo vea en vez de meterse al medio (0.35).
 --==========================================================================
 BotConfig.AI = {
 	-- MantleMaxHeight = 6.5,

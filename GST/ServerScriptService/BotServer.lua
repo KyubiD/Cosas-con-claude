@@ -35,6 +35,20 @@
 --      decisiones lejos de jugadores reales
 --  Ajustes en Tac.AI (se pueden pisar desde BotConfig.AI).
 --
+--  IA v3 (26/09/2026): edificios, puertas y memoria del mapa.
+--    · puertas: las abre desde cerca, espera quieto a que abran, cruza por
+--      el medio del marco, rodea la hoja si queda en el paso, nunca cierra
+--      una abierta, y una que no abre pasa a ser pared (otra ruta)
+--    · memoria compartida: lo que un bot no pudo alcanzar lo saben todos
+--      (no vuelven a ir ni gastan caminos ahi); se reinicia en cada ronda
+--    · lugares altos sin camino: busca un borde que se pueda trepar y sube
+--    · posiciones: revisa todos los pisos (ventanas del segundo piso,
+--      azoteas, muros bajos, colinas) y elige por vista, cobertura para
+--      asomarse, altura, techo y distancia de su arma
+--    · pelea a distancia: va a un lugar para asomarse (de pie dispara,
+--      agachado se tapa); espera abajo al que se subio donde no se llega
+--    · colinas: una ladera no es pared ni un hueco para saltar
+--
 --  PENDIENTE: killcam siguiendo al bot.
 --==========================================================================
 local Players = game:GetService("Players")
@@ -160,6 +174,20 @@ Tac.AI = {
 	--  Rendimiento
 	LodDistance = 260,			-- sin jugadores reales a esta distancia piensa mas lento
 	LodFactor = 0.5,
+	--  [IA v3] Puertas
+	DoorWaitMax = 2.2,			-- s esperando que una puerta abra antes de reintentar / darla por cerrada
+	DoorLockedTime = 60,		-- s que una puerta que no abre es pared para los caminos
+	--  [IA v3] Memoria del mapa (la comparten todos los bots)
+	MemoryTime = 90,			-- s que se recuerda un lugar inalcanzable (el doble si vuelve a fallar)
+	MemoryMax = 300,
+	--  [IA v3] Lugares altos sin camino
+	ClimbSearch = 12,			-- studs alrededor del destino donde buscar un borde para trepar
+	--  [IA v3] Posiciones
+	SmartPositions = true,		-- defensiva / estratega / camper eligen puesto mirando todos los pisos
+	PeekChance = 0.55,			-- peleando de lejos al descubierto: prob. de ir a un lugar para asomarse
+	PeekMinDistance = 22,		-- mas cerca que esto se pelea moviendose
+	PeekRange = 22,				-- studs a la redonda donde buscar ese lugar
+	OverwatchChance = 0.35,		-- yendo a un tiroteo lejano: prob. de ir a un lugar alto que lo vea
 }
 if type(Config.AI) == "table" then
 	for key, value in pairs(Config.AI) do Tac.AI[key] = value end
@@ -1291,7 +1319,8 @@ local function requestPath(state, goal, kind)
 	if now - state.lastRepath < 0.45 then return end
 	--  [IA v2] Destino donde hace poco no pudo subir: fallado sin calcular,
 	--  asi la tactica que lo pidio elige otro (en vez de volver a la pared).
-	if Tac.nearBlocked(state, goal) then
+	--  [IA v3] ...o que la memoria del mapa (compartida) da por inalcanzable.
+	if Tac.nearBlocked(state, goal) or Tac.isUnreachable(goal) then
 		state.lastRepath = now
 		state.pathFails += 1
 		return
@@ -1308,6 +1337,10 @@ local function requestPath(state, goal, kind)
 		and (goal - state.directGoal).Magnitude < 8 then
 		return
 	end
+	--  [IA v3] Subiendo a un lugar alto sin camino: primero al pie del borde
+	--  (nil = esta trepando ahora mismo).
+	local target = Tac.climbTarget(state, now, goal)
+	if not target then return end
 	--  [IA v2] Presupuesto global: si se acabo, se reintenta en la proxima vuelta.
 	if not Tac.takePathToken(kind) then return end
 	state.pathBusy = true
@@ -1316,9 +1349,10 @@ local function requestPath(state, goal, kind)
 	local startPos = state.root.Position
 	task.spawn(function()
 		local waypoints, usedPath = nil, nil
-		local from, to = startPos, goal
+		local from, to = startPos, target
 		local nudged = 0
-		for attempt, path in ipairs(Tac.pathOrder(state, startPos, goal)) do
+		local trusted = true		-- [IA v3] fallas "limpias" (NoPath): cuentan para la memoria
+		for attempt, path in ipairs(Tac.pathOrder(state, startPos, target)) do
 			--  [IA v2] Los reintentos con otro agente pueden pedir prestado: si
 			--  no, con varios bots fallando se agotaba el presupuesto y el agente
 			--  angosto (el que pasa por puertas y escaleras) no llegaba a probarse.
@@ -1343,6 +1377,7 @@ local function requestPath(state, goal, kind)
 				usedPath = path
 				break
 			end
+			if not ok or status == Enum.PathStatus.FailStartNotEmpty then trusted = false end
 		end
 		state.pathBusy = false
 		if not isAlive(state) then return end
@@ -1369,8 +1404,10 @@ local function requestPath(state, goal, kind)
 			state.pathFails += 1
 			state.waypoints = nil
 			state.pathGoal = nil
+			--  [IA v3] Mas alto: plan para trepar; si no, a la memoria del mapa.
+			if Tac.onPathFailed then Tac.onPathFailed(state, goal, target, startPos, trusted) end
 			--  [IA v2] Sin camino: si esta cerca, va derecho y el parkour resuelve.
-			if Tac.directFallback then Tac.directFallback(state, goal) end
+			if Tac.directFallback and not state.climbPlan then Tac.directFallback(state, goal) end
 		end
 	end)
 end
@@ -1442,7 +1479,10 @@ local function stepMovement(state, now)
 			--  cuenta como alcanzado: si no, el bot se quedaba dando vueltas en la
 			--  superficie encima de un punto al que nunca "llegaba".
 			local swimming = humanoid:GetState() == Enum.HumanoidStateType.Swimming
-			if flat(delta).Magnitude < 2.4 and (math.abs(delta.Y) < 6 or (swimming and delta.Y < 0)) then
+			--  [IA v3] A su altura (desde los pies): uno del piso de arriba o de
+			--  abajo no cuenta como alcanzado aunque este justo encima / debajo.
+			local rise = waypoint.Position.Y - (root.Position.Y - humanoid.HipHeight - root.Size.Y * 0.5)
+			if flat(delta).Magnitude < 2.4 and ((rise < 3.5 and rise > -6) or (swimming and delta.Y < 0)) then
 				state.wpIndex += 1
 				waypoint = state.waypoints[state.wpIndex]
 			end
@@ -1452,6 +1492,8 @@ local function stepMovement(state, now)
 			state.moveMode = "hold"
 			state.arrivedAt = now
 			humanoid:MoveTo(root.Position)
+			--  [IA v3] Llego: ese lugar se puede alcanzar (se borra de la memoria).
+			if state.pathGoal and (state.pathGoal - root.Position).Magnitude < 7 then Tac.markReached(state.pathGoal) end
 			return
 		end
 		--  [fase 3] Con ventarron a la intemperie, saltar te manda a volar.
@@ -1535,7 +1577,8 @@ end
 local function checkStuck(state, now)
 	checkWedged(state, now)
 	local M = Config.Movement
-	local moving = state.moveMode == "path" or state.moveMode == "strafe" or state.moveMode == "direct"
+	--  [IA v3] Esperando que abra una puerta no esta atorado (no le salta encima).
+	local moving = (state.moveMode == "path" or state.moveMode == "strafe" or state.moveMode == "direct") and not state.doorPass
 	if not moving or (state.root.Position - state.progressPos).Magnitude > 1.5 then
 		state.progressPos = state.root.Position
 		state.progressAt = now
@@ -1572,6 +1615,12 @@ local function pickRoamGoal(state)
 	if Tac.pickHotspot and rng:NextNumber() < Tac.AI.HotspotChance then
 		local spot = Tac.pickHotspot(state, now)
 		if spot then
+			--  [IA v3] A veces, en vez de meterse en el medio, un lugar alto o con
+			--  cobertura desde donde se ve el tiroteo.
+			if rng:NextNumber() < Tac.AI.OverwatchChance and (spot.pos - state.root.Position).Magnitude > 70 then
+				local vantage = Tac.findOverwatch(state, spot.pos)
+				if vantage then return vantage end
+			end
 			local fuzz = math.clamp((spot.pos - state.root.Position).Magnitude * 0.06, 4, 30)
 			return spot.pos + Vector3.new(rng:NextNumber(-1, 1), 0, rng:NextNumber(-1, 1)) * fuzz
 		end
@@ -1858,6 +1907,8 @@ local function decideMovement(state, now)
 
 	--  [tacticas] Con poca vida: a cubrirse (o sigue escondido).
 	if Tac.updateCover and Tac.updateCover(state, now) then return end
+	--  [IA v3] En su lugar para asomarse (o yendo a el).
+	if Tac.updatePeek and Tac.updatePeek(state, now) then return end
 
 	if target and state.visible then
 		local dist = (target.root.Position - state.root.Position).Magnitude
@@ -1938,8 +1989,15 @@ local function decideMovement(state, now)
 		local role = state.meta.role
 		local rangeMult = (role and role.RangeMult) or 1
 		local idealMin, idealMax = cfg.IdealMin * rangeMult, cfg.IdealMax * rangeMult
-		local posted = (state.hold and state.hold.arrived) or (state.watch and state.watch.arrived)
-			or (state.perch and state.perch.arrived) or cfg.Role == "Sniper"
+		local atPost = (state.hold and state.hold.arrived) or (state.watch and state.watch.arrived)
+			or (state.perch and state.perch.arrived)
+		--  [IA v3] Al descubierto a media / larga distancia: un lugar cerca para
+		--  asomarse (ventana, muro bajo, cresta) en vez de quedarse parado. El
+		--  francotirador tambien (es el que mas lo aprovecha).
+		if not atPost and not reloading and Tac.considerPeek and Tac.considerPeek(state, now, target, dist) and Tac.updatePeek(state, now) then
+			return
+		end
+		local posted = atPost or cfg.Role == "Sniper"
 		if posted and not reloading and dist <= cfg.MaxRange then
 			if state.moveMode ~= "hold" then stopWalking(state) end
 			return
@@ -2022,6 +2080,9 @@ local function decideMovement(state, now)
 	--  perseguir a nadie), desde una posicion razonable.
 	if Tac.seekRevive(state, now) then return end
 
+	--  [IA v3] Esperando abajo al que se subio donde no se puede llegar.
+	if Tac.ambushStep and Tac.ambushStep(state, now) then return end
+
 	--  [24/09] Ordenes del Lider del equipo (bot de tipo Lider).
 	if Tac.followOrders and Tac.followOrders(state, now) then return end
 
@@ -2036,6 +2097,12 @@ local function decideMovement(state, now)
 		local distToLast = flat(goal - state.root.Position).Magnitude
 		humanoid.WalkSpeed = distToLast > 40 and RUN_SPEED or WALK_SPEED
 		if distToLast < M.ArriveDistance + 1 or state.pathFails >= 3 then
+			--  [IA v3] No se puede llegar hasta donde se fue (mas arriba): lo espera
+			--  desde un lugar que lo vea, en vez de rendirse.
+			if state.pathFails >= 3 and goal.Y - state.root.Position.Y > 3 and Tac.startAmbush and Tac.startAmbush(state, now, goal) then
+				state.pathFails = 0
+				return
+			end
 			state.target = nil
 			state.pathFails = 0
 			--  Mira hacia donde se fue; si no se sabe, a un costado.
@@ -2090,6 +2157,10 @@ local function decideMovement(state, now)
 		state.roamRun = state.rng:NextNumber() < ((state.meta.role and state.meta.role.RunChance) or 0.7)
 		--  [23/09 noche] Con clima peligroso, solo a destinos seguros.
 		local roamGoal = pickRoamGoal(state)
+		--  [IA v3] Uno que ya se sabe inalcanzable: otro.
+		for _ = 1, 2 do
+			if roamGoal and Tac.isUnreachable(roamGoal) then roamGoal = pickRoamGoal(state) end
+		end
 		if Tac.safeRoamGoal then roamGoal = Tac.safeRoamGoal(state, roamGoal, now) end
 		if roamGoal then requestPath(state, roamGoal, "roam") end
 	elseif idle and state.pathFails >= 4 then
@@ -2831,7 +2902,13 @@ function Tac.abandonRoute(state, now)
 	table.insert(state.blockedSpots, { pos = here, untilT = now + Tac.AI.BlockedSpotTime })
 	--  El destino tambien: requestPath lo da por fallado sin calcular.
 	local goal = state.pathGoal or state.directGoal
-	if goal then table.insert(state.blockedSpots, { pos = goal, untilT = now + Tac.AI.BlockedSpotTime }) end
+	if goal then
+		table.insert(state.blockedSpots, { pos = goal, untilT = now + Tac.AI.BlockedSpotTime })
+		--  [IA v3] Y a la memoria compartida; no volver a planear trepar ahi ya.
+		Tac.markUnreachable(goal, 1, "atascado")
+		state.noClimbFor, state.noClimbUntil = goal, now + 20
+	end
+	state.climbPlan, state.climbing = nil, nil
 	while #state.blockedSpots > 10 do table.remove(state.blockedSpots, 1) end
 	state.stuckGoal = nil
 	state.noJumpPathUntil = now + 12
@@ -3034,7 +3111,9 @@ function Tac.walkLineClear(fromPos, feetY, target, params)
 	if length < 0.5 then return true end
 	local side = Vector3.new(-delta.Z, 0, delta.X)
 	if side.Magnitude < 0.01 then return false end
-	side = side.Unit * 0.9
+	--  [IA v3] Con el ancho del cuerpo y un poco mas: a 0.9 rozaba el marco de
+	--  las puertas y se quedaba trabado en la esquina.
+	side = side.Unit * 1.25
 	if workspace:Raycast(a + side, delta, params) or workspace:Raycast(a - side, delta, params) then return false end
 	if workspace:Raycast(a + Vector3.new(0, 2.6, 0), delta, params) then return false end
 	local steps = math.clamp(math.floor(length / 4), 1, 4)
@@ -3142,6 +3221,10 @@ function Tac.tryLeap(state, now, dir, base, goal, params)
 	local humanoid, root = state.humanoid, state.root
 	local feetY = base.Y
 	if workspace:Raycast(base + dir * 3 + Vector3.new(0, 1.5, 0), Vector3.new(0, -4.8, 0), params) then return end
+	--  [IA v3] Bajada de una colina (el piso sigue, en pendiente) o un escalon
+	--  que se baja caminando: no es un hueco.
+	local deep = workspace:Raycast(base + dir * 3 + Vector3.new(0, 1.5, 0), Vector3.new(0, -12, 0), params)
+	if deep and (deep.Normal.Y < 0.95 or feetY - deep.Position.Y <= 4.8) then return end
 	--  Destino mas abajo: es una bajada a proposito (balcon, escalera rota).
 	if goal.Y < feetY - 3 or flat(goal - root.Position).Magnitude < 3 then return end
 	if now < (state.nextJumpAt or 0) then return end
@@ -3238,6 +3321,9 @@ function Tac.parkour(state, now)
 	local blocked = state.slowSince ~= nil and now - state.slowSince > 0.35
 
 	local low = workspace:Raycast(base + Vector3.new(0, 0.9, 0), ahead, params)
+	--  [IA v3] Una ladera empinada (colina de terreno, rampa) se sube caminando:
+	--  no es pared salvo que de verdad lo frene.
+	if low and low.Normal.Y >= 0.3 and low.Normal.Y < 0.6 and not blocked then return end
 	if low and low.Normal.Y < 0.6 and not (Tac.doorParts and Tac.doorParts[low.Instance]) then
 		--  Con camino, solo si el camino sube por ahi o si lo esta frenando
 		--  (no se sube a cada caja que roza).
@@ -3639,7 +3725,7 @@ function Tac.findCover(state, threatPos, maxRing)
 			local angle = i * (math.pi / 6) + state.rng:NextNumber(-0.2, 0.2)
 			local probe = origin + Vector3.new(math.cos(angle) * radius, 4, math.sin(angle) * radius)
 			local ground = workspace:Raycast(probe, Vector3.new(0, -12, 0), Tac.params)
-			if ground and ground.Normal.Y > 0.7 then
+			if ground and ground.Normal.Y > 0.7 and not Tac.isUnreachable(ground.Position) then
 				local spot = ground.Position
 				local crouchHead = spot + Vector3.new(0, 2.4, 0)
 				local toSpot = crouchHead - threatEye
@@ -3735,17 +3821,20 @@ end
 --  Agacharse (lo decide updateWindStance junto con el ventarron)
 -- --------------------------------------------------------------------------
 function Tac.wantsCrouch(state, now)
+	if state.peek and state.peek.arrived then return Tac.postCrouch(state, state.peek, now) end		-- [IA v3]
 	if state.cover and state.cover.arrived then return true end
 	if state.crouchUntil and now < state.crouchUntil then return true end		-- [IA v2] agacharse en pelea
 	--  [24/09] Levantando a alguien con peligro cerca: agachado.
 	if state.reviveFace and ((state.target and state.visible) or (state.lastDamageAt and now - state.lastDamageAt < 4)) then
 		return true
 	end
-	if state.hold and state.hold.arrived then return true end
-	if state.watch and state.watch.arrived then return true end
+	--  [IA v3] Un puesto para asomarse: de pie (agachado no ve), salvo recargando.
+	if state.hold and state.hold.arrived then return Tac.postCrouch(state, state.hold, now) end
+	if state.watch and state.watch.arrived then return Tac.postCrouch(state, state.watch, now) end
+	if state.ambush and state.ambush.arrived then return Tac.postCrouch(state, state.ambush, now) end
 	--  [23/09 noche] Sigiloso cerca de su presa, lider en su puesto.
 	if state.sneakClose then return true end
-	if state.perch and state.perch.arrived then return true end		-- [24/09] camper en su punto
+	if state.perch and state.perch.arrived then return Tac.postCrouch(state, state.perch, now) end		-- [24/09] camper en su punto
 	if state.leaderSpot and state.leaderSpot.arrived then return true end
 	if state.leaderCover and state.leaderCover.arrived then return true end
 	--  Tirador quieto apuntando: agachado, como haria una persona.
@@ -3839,7 +3928,7 @@ function Tac.findHoldSpot(state)
 		local radius = rng:NextNumber(6, 45)
 		local probe = Vector3.new(center.X + math.cos(angle) * radius, origin.Y + 6, center.Z + math.sin(angle) * radius)
 		local ground = workspace:Raycast(probe, Vector3.new(0, -18, 0), Tac.params)
-		if ground and ground.Normal.Y > 0.7 then
+		if ground and ground.Normal.Y > 0.7 and not Tac.isUnreachable(ground.Position) then
 			local spot = ground.Position
 			local eye = spot + Vector3.new(0, 2.6, 0)
 			--  Nada justo encima (debajo de una mesa no se campea).
@@ -3919,9 +4008,58 @@ function Tac.defend(state, now)
 		state.hold = nil
 		hold = nil
 	end
+	--  [IA v3] La amenaza ahora viene de otro lado y desde el puesto no se la
+	--  ve: otro puesto (no se queda mirando a la pared unos 30 s).
+	if hold and hold.threat and now - (hold.since or now) > 4 and now >= (state.nextHoldPick or 0) then
+		local threat = Tac.threatGuess(state, now)
+		if threat and (threat - hold.threat).Magnitude > 30 then
+			hold.threat = threat
+			Tac.params.FilterDescendantsInstances = Tac.worldFilter()
+			local eye = hold.pos + Vector3.new(0, 4.6, 0)
+			local hit = workspace:Raycast(eye, threat - eye, Tac.params)
+			if hit and (hit.Position - eye).Magnitude < (threat - eye).Magnitude * 0.9 then
+				state.hold = nil
+				hold = nil
+			end
+		end
+	end
 	if not hold then
+		if state.spotChecking then
+			--  [IA v3] Comprobando el camino al puesto nuevo (un momento): quieto
+			--  mirando hacia la amenaza, no sale a investigar el ruido.
+			if state.moveMode ~= "hold" then stopWalking(state) end
+			state.lookAt = Tac.threatGuess(state, now)
+			state.lookUntil = now + 0.5
+			return true
+		end
 		if now < (state.nextHoldPick or 0) then return false end
 		state.nextHoldPick = now + 3
+		--  [IA v3] Un puesto mirando todos los pisos (ventana del segundo piso,
+		--  muro bajo, colina) hacia donde deberia venir el enemigo, con camino
+		--  comprobado. Mientras lo comprueba, sigue con lo normal.
+		local threat = Tac.AI.SmartPositions and Tac.threatGuess(state, now)
+		if threat then
+			local idealMin, idealMax, maxRange = Tac.weaponRanges(state)
+			local origin = state.root.Position
+			local ctx = { threat = threat, center = origin:Lerp(threat, 0.3), minRadius = 4, maxRadius = 45,
+				needView = true, heightWeight = 0.8, idealMin = idealMin, idealMax = idealMax, maxRange = maxRange }
+			local list = Tac.findPositions(state, ctx)
+			if #list == 0 then
+				--  Nada lo ve (esta detras de paredes): un lugar cubierto hacia alla.
+				ctx.needView = false
+				list = Tac.findPositions(state, ctx)
+			end
+			if #list > 0 then
+				Tac.validateSpots(state, list, 4, function(candidate)
+					state.hold = { pos = candidate.pos, face = threat, arrived = false, peek = candidate.peek,
+						threat = threat, since = os.clock(),
+						untilT = os.clock() + rangeNumber(state.rng, role.HoldTime or { 25, 55 }) }
+					state.pathFails = 0
+					dprint(state.bot.Name, candidate.pos.Y - origin.Y > 4 and "toma un puesto en alto" or "toma un puesto")
+				end)
+				return false
+			end
+		end
 		local spot = Tac.findHoldSpot(state)
 		if not spot then return false end
 		hold = { pos = spot.pos, face = spot.face, untilT = now + rangeNumber(state.rng, role.HoldTime or { 25, 55 }), arrived = false }
@@ -3929,8 +4067,8 @@ function Tac.defend(state, now)
 		state.pathFails = 0
 	end
 	local dist = flat(hold.pos - state.root.Position).Magnitude
-	if dist > 3.5 and not hold.arrived then
-		Tac.goTo(state, now, hold.pos, "hold", dist > 40 and RUN_SPEED or WALK_SPEED, 5)
+	if not hold.arrived and not Tac.atPost(state, hold.pos, hold.peek and 1.6 or 3.5) then
+		if not state.finalStep then Tac.goTo(state, now, hold.pos, "hold", dist > 40 and RUN_SPEED or WALK_SPEED, 5) end
 		if state.pathFails >= 3 then
 			state.hold = nil
 			state.pathFails = 0
@@ -3970,8 +4108,8 @@ function Tac.strategize(state, now)
 			state.nextWatchAt = now + rangeNumber(state.rng, role.WatchCooldown or { 8, 16 })
 		else
 			local dist = flat(watch.pos - state.root.Position).Magnitude
-			if dist > 3.5 and not watch.arrived then
-				Tac.goTo(state, now, watch.pos, "watch", WALK_SPEED, 3)
+			if not watch.arrived and not Tac.atPost(state, watch.pos, watch.peek and 1.6 or 3.5) then
+				if not state.finalStep then Tac.goTo(state, now, watch.pos, "watch", WALK_SPEED, 3) end
 				if state.pathFails >= 3 then watch.arrived = true end
 				return true
 			end
@@ -3997,8 +4135,16 @@ function Tac.strategize(state, now)
 		end
 	end
 	if info then
-		local spot = Tac.findWatchSpot(state, info) or state.root.Position
-		state.watch = { pos = spot, info = info, untilT = now + rangeNumber(state.rng, role.WatchTime or { 6, 12 }), arrived = false }
+		--  [IA v3] El angulo se busca en todos los pisos (una ventana arriba).
+		local spot, peekSpot = nil, false
+		if Tac.AI.SmartPositions then
+			local idealMin, idealMax = Tac.weaponRanges(state)
+			local best = Tac.findPositions(state, { threat = info, center = state.root.Position, minRadius = 4, maxRadius = 30,
+				needView = true, samples = 18, heightWeight = 0.6, idealMin = idealMin, idealMax = idealMax })[1]
+			if best then spot, peekSpot = best.pos, best.peek end
+		end
+		spot = spot or Tac.findWatchSpot(state, info) or state.root.Position
+		state.watch = { pos = spot, info = info, untilT = now + rangeNumber(state.rng, role.WatchTime or { 6, 12 }), arrived = false, peek = peekSpot }
 		state.noise = nil
 		state.pathFails = 0
 		return true
@@ -4603,7 +4749,7 @@ function Tac.stealth(state, now)
 end
 
 -- --------------------------------------------------------------------------
---  PUERTAS (23/09 noche)
+--  PUERTAS (23/09 noche; [IA v3] 26/09: pasarlas bien)
 --
 --  Las puertas de los mapas se abren con un ProximityPrompt, y un prompt solo
 --  lo puede activar un cliente. Los scripts de las puertas se parcharon para
@@ -4611,8 +4757,16 @@ end
 --  mismo que Triggered: abre / cierra con su sonido). Aqui:
 --    · cada puerta lleva un PathfindingModifier PassThrough, asi los caminos
 --      no la toman como pared y pasan por ella;
---    · si una puerta CERRADA le tapa el paso, el bot la abre, espera a que
---      gire y sigue. Una que ya esta abierta no la vuelve a cerrar.
+--    · [IA v3] se mira el camino que sigue (hasta ~9 studs, doblando con el
+--      camino). Una puerta cerrada en el medio se abre desde cerca, se
+--      espera quieto hasta que deja pasar (sin saltarle encima), y si la
+--      hoja abierta queda tapando el paso se pasa por el costado libre;
+--    · abierta = su script lo dice (texto "Close" / atributo Open) o la hoja
+--      ya no esta donde estaba al registrarse. Una puerta abierta nunca se
+--      vuelve a cerrar (antes, con un kit que no cambia el texto, el
+--      siguiente bot la cerraba en la cara del primero);
+--    · una que no abre (con llave, un script sin el parche) pasa a ser pared
+--      para los caminos DoorLockedTime segundos y se busca otra ruta.
 -- --------------------------------------------------------------------------
 Tac.doorParts = setmetatable({}, { __mode = "k" })		-- [BasePart] = puerta
 Tac.doorList = {}
@@ -4629,10 +4783,26 @@ function Tac.registerDoor(botTrigger)
 	for _, door in ipairs(Tac.doorList) do
 		if door.prompt == prompt then return end
 	end
-	local info = { prompt = prompt, trigger = botTrigger, model = model }
+	--  home: donde esta cada pieza solida al empezar (cerrada): si se movio,
+	--  esta abierta, diga lo que diga el texto del prompt.
+	local info = { prompt = prompt, trigger = botTrigger, model = model, home = {} }
 	table.insert(Tac.doorList, info)
+	local biggest = 0
 	for _, part in ipairs(model:GetDescendants()) do
-		if part:IsA("BasePart") then Tac.doorParts[part] = info end
+		if part:IsA("BasePart") then
+			Tac.doorParts[part] = info
+			if part.CanCollide then
+				info.home[part] = part.CFrame
+				--  El hueco de la puerta: la hoja cerrada (la pieza mas grande).
+				local size = part.Size
+				local area = math.max(size.X, size.Z) * size.Y
+				local thin = flat(size.X < size.Z and part.CFrame.RightVector or part.CFrame.LookVector)
+				if area > biggest and thin.Magnitude > 0.5 then
+					biggest = area
+					info.doorway = { center = part.Position, normal = thin.Unit }
+				end
+			end
+		end
 	end
 	if not model:FindFirstChild("BotDoorPassThrough") then
 		local modifier = Instance.new("PathfindingModifier")
@@ -4643,11 +4813,28 @@ function Tac.registerDoor(botTrigger)
 	end
 end
 
---  Abierta segun el propio script de la puerta: el kit de la casa / Metro
---  cambia el texto del prompt a "Close"; RealisticDoorPack usa el atributo Open.
+--  La hoja ya no esta donde estaba (giro, se deslizo o dejo de ser solida).
+function Tac.doorMoved(info)
+	for part, home in pairs(info.home) do
+		if part.Parent then
+			if not part.CanCollide then return true end
+			local cframe = part.CFrame
+			if (cframe.Position - home.Position).Magnitude > 0.4 or cframe.LookVector:Dot(home.LookVector) < 0.97 then
+				return true
+			end
+		end
+	end
+	return false
+end
+
+--  Abierta segun el propio script de la puerta (el kit de la casa / Metro
+--  cambia el texto del prompt a "Close"; RealisticDoorPack usa el atributo
+--  Open) o porque la hoja se movio.
 function Tac.doorIsOpen(info)
 	if info.model:GetAttribute("Open") == true then return true end
-	return info.prompt.ActionText == "Close"
+	local text = info.prompt.ActionText
+	if text == "Close" or text == "Cerrar" then return true end
+	return Tac.doorMoved(info)
 end
 
 function Tac.doorAnchor(info)
@@ -4657,52 +4844,329 @@ function Tac.doorAnchor(info)
 	return nil
 end
 
-function Tac.useDoor(state, now, info)
-	local prompt = info.prompt
-	if not prompt.Parent or not prompt.Enabled or not info.trigger.Parent then return false end
-	if Tac.doorIsOpen(info) then return false end
-	local anchor = Tac.doorAnchor(info)
-	if anchor and (anchor - state.root.Position).Magnitude > prompt.MaxActivationDistance + 4 then return false end
-	if now - (Tac.doorCooldown[prompt] or -10) < 2.5 then
-		--  Otro la acaba de activar: esperar a que termine de abrir.
-		state.doorWaitUntil = math.max(state.doorWaitUntil or 0, now + 0.6)
-		return true
-	end
-	Tac.doorCooldown[prompt] = now
-	info.trigger:Fire()
-	state.doorWaitUntil = now + 1.1
-	state.humanoid:MoveTo(state.root.Position)
-	state.lastMoveTarget = nil		-- al terminar, que vuelva a mandar su MoveTo
-	dprint(state.bot.Name, "abre una puerta")
-	return true
-end
-
---  Cada vuelta de decisiones: una puerta cerrada justo delante, en la
---  direccion en que camina, se abre.
-function Tac.checkDoors(state, now)
-	if #Tac.doorList == 0 or now < (state.doorWaitUntil or 0) then return end
-	if state.moveMode ~= "path" and state.moveMode ~= "direct" then return end
-	local goal = nil
-	if state.moveMode == "path" and state.waypoints then
-		local waypoint = state.waypoints[state.wpIndex]
-		goal = waypoint and waypoint.Position
-	else
-		goal = state.humanoid.WalkToPoint
-	end
-	if not goal then return end
-	local dir = flat(goal - state.root.Position)
-	if dir.Magnitude < 0.5 then return end
-	dir = dir.Unit
+--  Una pieza solida de ESA puerta delante (en la direccion en que pasa).
+function Tac.doorBlocking(state, info, dir, reach)
 	Tac.doorParams.FilterDescendantsInstances = { state.character, ACS_Workspace }
 	for _, height in ipairs({ 0.5, -1.2 }) do
-		local result = workspace:Raycast(state.root.Position + Vector3.new(0, height, 0), dir * 5, Tac.doorParams)
-		local info = result and Tac.doorParts[result.Instance]
-		if info and Tac.useDoor(state, now, info) then return end
+		local result = workspace:Raycast(state.root.Position + Vector3.new(0, height, 0), dir * (reach or 4), Tac.doorParams)
+		if result and Tac.doorParts[result.Instance] == info and result.Instance.CanCollide then return result end
+	end
+	return nil
+end
+
+--  Tramos del camino que tiene por delante (hasta 'reach' studs), a la
+--  altura de su cuerpo.
+function Tac.routeAhead(state, reach)
+	local root = state.root.Position
+	local out = {}
+	if state.moveMode == "path" and state.waypoints then
+		local total, prev = 0, root
+		for i = state.wpIndex, math.min(#state.waypoints, state.wpIndex + 3) do
+			local point = state.waypoints[i].Position + Vector3.new(0, 3, 0)
+			local segment = point - prev
+			local length = segment.Magnitude
+			if length > 0.2 then
+				table.insert(out, { from = prev, dir = segment.Unit, length = math.min(length, reach - total) })
+				total += length
+				if total >= reach then break end
+			end
+			prev = point
+		end
+	elseif state.moveMode == "direct" then
+		local segment = flat(state.humanoid.WalkToPoint - root)
+		if segment.Magnitude > 0.5 then
+			table.insert(out, { from = root, dir = segment.Unit, length = math.min(segment.Magnitude, reach) })
+		end
+	end
+	return out
+end
+
+--  Cada vuelta de decisiones: una puerta en el camino que sigue.
+function Tac.checkDoors(state, now)
+	if #Tac.doorList == 0 or state.doorPass then return end
+	if state.moveMode ~= "path" and state.moveMode ~= "direct" then return end
+	--  Sin ninguna puerta cerca, ni un rayo.
+	local root = state.root.Position
+	local near = false
+	for _, info in ipairs(Tac.doorList) do
+		local anchor = info.doorway and info.doorway.center or Tac.doorAnchor(info)
+		if anchor and (anchor - root).Magnitude < 14 then
+			near = true
+			break
+		end
+	end
+	if not near then return end
+	Tac.doorParams.FilterDescendantsInstances = { state.character, ACS_Workspace }
+	for _, segment in ipairs(Tac.routeAhead(state, 9)) do
+		for _, height in ipairs({ 0.5, -1.2 }) do
+			local result = workspace:Raycast(segment.from + Vector3.new(0, height, 0), segment.dir * segment.length, Tac.doorParams)
+			local info = result and Tac.doorParts[result.Instance]
+			if info and result.Instance.CanCollide then
+				Tac.startDoorPass(state, now, info, segment.dir)
+				return
+			end
+		end
 	end
 end
 
---  Atorado: si hay una puerta cerrada a unos pasos, la abre.
+function Tac.startDoorPass(state, now, info, dir)
+	--  Trabada / con llave: los caminos ya la toman como pared.
+	if info.lockedUntil and now < info.lockedUntil then return end
+	local horizontal = flat(dir)
+	if horizontal.Magnitude < 0.2 then return end
+	state.doorPass = { info = info, dir = horizontal.Unit, startAt = now, phase = "approach", tries = 0 }
+end
+
+--  Activa el prompt (como un jugador apretando E). Si otro bot la acaba de
+--  usar, solo espera a que termine de moverse.
+function Tac.fireDoor(state, now, info)
+	local prompt = info.prompt
+	local last = Tac.doorCooldown[prompt]
+	if last and now - last.at < (last.by == state and 1.5 or 2.5) then return end
+	if not prompt.Enabled or not info.trigger.Parent then return end
+	Tac.doorCooldown[prompt] = { at = now, by = state }
+	info.trigger:Fire()
+	dprint(state.bot.Name, "abre una puerta")
+end
+
+--  No hay forma de pasar por esta puerta: se deja el camino (el proximo ya
+--  la toma como pared si quedo marcada) y cuenta como falla del destino.
+function Tac.doorGiveUp(state, now, info)
+	state.doorPass = nil
+	state.detour = nil
+	state.waypoints = nil
+	state.moveMode = "hold"
+	state.humanoid:MoveTo(state.root.Position)
+	state.pathFails += 1
+	state.goodPath = nil
+	state.lastRepath = now - 1
+end
+
+function Tac.lockDoor(info, now)
+	local AI = Tac.AI
+	info.lockedUntil = now + AI.DoorLockedTime
+	local modifier = info.model:FindFirstChild("BotDoorPassThrough")
+	if modifier then modifier.PassThrough = false end
+	dprint("puerta que no abre (" .. info.model.Name .. "): es pared por " .. AI.DoorLockedTime .. " s")
+	task.delay(AI.DoorLockedTime, function()
+		if info.lockedUntil and os.clock() >= info.lockedUntil - 0.5 then Tac.unlockDoor(info) end
+	end)
+end
+
+function Tac.unlockDoor(info)
+	info.lockedUntil = nil
+	local modifier = info.model:FindFirstChild("BotDoorPassThrough")
+	if modifier then modifier.PassThrough = true end
+end
+
+--  Cada frame mientras pasa una puerta. true = esta quieto esperando.
+function Tac.doorStep(state, now)
+	local pass = state.doorPass
+	if not pass then return false end
+	local AI = Tac.AI
+	local info = pass.info
+	if not info.prompt.Parent or not info.model.Parent or now - pass.startAt > AI.DoorWaitMax * 3
+		or (state.moveMode ~= "path" and state.moveMode ~= "direct") then
+		state.doorPass = nil
+		return false
+	end
+	local blocking = Tac.doorBlocking(state, info, pass.dir, pass.phase == "approach" and 3.5 or 4.5)
+
+	if pass.phase == "approach" then
+		--  Camina hasta tenerla cerca; si deja de estar en el camino, listo.
+		if not blocking then
+			if now - pass.startAt > 3 then state.doorPass = nil end
+			return false
+		end
+		if Tac.doorIsOpen(info) then
+			pass.phase = "side"
+		else
+			Tac.fireDoor(state, now, info)
+			pass.phase, pass.firedAt, pass.tries = "wait", now, 1
+			state.humanoid:MoveTo(state.root.Position)
+			state.lastMoveTarget = nil
+			return true
+		end
+	end
+
+	if pass.phase == "wait" then
+		if not blocking then
+			--  Ya deja pasar: cruza derecho por el medio del marco (en diagonal se
+			--  trababa con el marco) y despues sigue su camino.
+			local points = Tac.doorThrough(state, info)
+			if points then
+				pass.phase, pass.sideAt, pass.around, pass.aroundStep = "side", now, points, 1
+				state.detour = { pos = points[1], untilT = now + 1.2 }
+				state.lastMoveTarget = nil
+				return false
+			end
+			Tac.doorPassDone(state)
+			return false
+		end
+		local waited = now - pass.firedAt
+		if waited > 0.6 and Tac.doorIsOpen(info) then
+			pass.phase = "side"		-- abierta, pero la hoja quedo en el medio
+		elseif waited > AI.DoorWaitMax then
+			if pass.tries < 2 then
+				--  Quizas el primer intento no le llego: una vez mas.
+				pass.tries += 1
+				pass.firedAt = now
+				Tac.fireDoor(state, now, info)
+			else
+				Tac.lockDoor(info, now)
+				Tac.doorGiveUp(state, now, info)
+				return false
+			end
+		end
+		if pass.phase == "wait" then return true end
+	end
+
+	if pass.phase == "side" then
+		if not state.detour and (not pass.around or pass.aroundStep >= #pass.around) and (not blocking or pass.around) then
+			Tac.doorPassDone(state)
+			return false
+		end
+		if not pass.sideAt then
+			pass.sideAt = now
+			--  Rodear la hoja por su punta libre (la otra esta pegada al marco):
+			--  alejarse de la hoja, ir a lo largo de ella y pasar la punta.
+			pass.around = blocking and Tac.doorGoAround(state, blocking.Instance, pass.dir)
+			if pass.around then
+				pass.aroundStep = 1
+				state.detour = { pos = pass.around[1], untilT = now + 1.2 }
+				state.lastMoveTarget = nil
+			else
+				pass.sideAt = now - 10		-- no hay por donde
+			end
+		end
+		local around = pass.around
+		if around and pass.aroundStep < #around
+			and (not state.detour or flat(around[pass.aroundStep] - state.root.Position).Magnitude < 0.9) then
+			pass.aroundStep += 1
+			state.detour = { pos = around[pass.aroundStep], untilT = now + 1.4 }
+			state.lastMoveTarget = nil
+		end
+		if now - pass.sideAt > 4 then
+			if blocking then
+				--  La hoja tapa todo el paso: se la trata como cerrada un rato.
+				info.lockedUntil = now + 20
+				local modifier = info.model:FindFirstChild("BotDoorPassThrough")
+				if modifier then
+					modifier.PassThrough = false
+					task.delay(20, function() Tac.unlockDoor(info) end)
+				end
+				Tac.doorGiveUp(state, now, info)
+			else
+				Tac.doorPassDone(state)
+			end
+		end
+		return false
+	end
+	return false
+end
+
+--  Puntos para rodear una hoja abierta que tapa el paso: separarse de la
+--  hoja (con el ancho del cuerpo), ir a lo largo de ella y pasar su punta
+--  libre (la que no toca el marco), la que queda hacia donde va.
+function Tac.doorGoAround(state, leaf, dir)
+	local cframe, size = leaf.CFrame, leaf.Size
+	local axis, half = cframe.RightVector, size.X / 2
+	if size.Z > size.X then axis, half = cframe.LookVector, size.Z / 2 end
+	axis = flat(axis)
+	if axis.Magnitude < 0.2 then return nil end
+	axis = axis.Unit
+	local normal = Vector3.new(-axis.Z, 0, axis.X)
+	local root = state.root.Position
+	local center = Vector3.new(cframe.Position.X, root.Y, cframe.Position.Z)
+	local offset = (root - center):Dot(normal)
+	local side = offset >= 0 and 1 or -1
+	Tac.doorParams.FilterDescendantsInstances = { state.character, ACS_Workspace }
+	local best = nil
+	for _, sign in ipairs({ 1, -1 }) do
+		local tip = center + axis * sign * half
+		--  Libre de los dos lados de la hoja y por el medio: la punta de la
+		--  bisagra tiene el marco del otro lado (mirando de un solo lado, a
+		--  veces la "rodeaba" por la bisagra y salia por la puerta).
+		local free = true
+		for _, lateral in ipairs({ 1.4, 0, -1.4 }) do
+			local from = tip - axis * sign * 0.3 + normal * side * lateral
+			if workspace:Raycast(from, axis * sign * 2.2, Tac.doorParams) then
+				free = false
+				break
+			end
+		end
+		if free then
+			local score = (axis * sign):Dot(dir)
+			if not best or score > best.score then best = { sign = sign, tip = tip, score = score } end
+		end
+	end
+	if not best then return nil end
+	local points = {}
+	if math.abs(offset) < 1.6 then
+		table.insert(points, root + normal * side * (1.6 - math.abs(offset)))
+	end
+	table.insert(points, best.tip + normal * side * 1.6)
+	--  Pasando la punta, ya del otro lado de la hoja (hacia donde sigue).
+	table.insert(points, best.tip + axis * best.sign * 2 - normal * side * 1.2)
+	return points
+end
+
+--  Cruzar el marco derecho: delante del centro y despues del otro lado.
+function Tac.doorThrough(state, info)
+	local doorway = info.doorway
+	if not doorway or doorway.normal.Magnitude < 0.5 then return nil end
+	local root = state.root.Position
+	local center = Vector3.new(doorway.center.X, root.Y, doorway.center.Z)
+	if flat(root - center).Magnitude > 7 then return nil end
+	local side = (root - center):Dot(doorway.normal) >= 0 and 1 or -1
+	return { center + doorway.normal * side * 1.4, center - doorway.normal * side * 3.2 }
+end
+
+--  Termino de pasar una puerta (quizas rodeando la hoja): sigue su camino
+--  desde el punto mas cercano que tiene por delante, no desde uno que quedo
+--  atras (volvia hasta la puerta).
+function Tac.doorPassDone(state)
+	local pass = state.doorPass
+	state.doorPass = nil
+	state.lastMoveTarget = nil
+	local waypoints = state.waypoints
+	if state.moveMode ~= "path" or not waypoints then return end
+	local here = state.root.Position
+	if pass and pass.around then
+		--  Rodeo la hoja: el navmesh no la ve (la puerta es PassThrough) y
+		--  puede haber dejado puntos pegados a ella. Retoma en el mas lejano
+		--  al que llega en linea recta.
+		local feetY = here.Y - state.humanoid.HipHeight - state.root.Size.Y * 0.5
+		local params = Tac.moveParams
+		params.FilterDescendantsInstances = Tac.worldFilter()
+		for i = math.min(#waypoints, state.wpIndex + 4), state.wpIndex, -1 do
+			local target = waypoints[i].Position
+			if math.abs(target.Y - feetY) < 2.5 and Tac.walkLineClear(here, feetY, target, params) then
+				state.wpIndex = i
+				return
+			end
+		end
+	end
+	local best, bestDist = state.wpIndex, math.huge
+	for i = state.wpIndex, math.min(#waypoints, state.wpIndex + 6) do
+		local dist = (waypoints[i].Position + Vector3.new(0, 3, 0) - here).Magnitude
+		if dist < bestDist then best, bestDist = i, dist end
+	end
+	--  Ese punto se da por pasado solo si esta encima o si ya lo dejo atras.
+	if best < #waypoints then
+		local point = waypoints[best].Position
+		local along = flat(waypoints[best + 1].Position - point)
+		if bestDist < 4.8 and (flat(here - point).Magnitude < 1.8
+			or (along.Magnitude > 0.1 and flat(here - point):Dot(along.Unit) > 0.5)) then
+			best += 1
+		end
+	end
+	state.wpIndex = best
+end
+
+--  Atorado: si hay una puerta cerrada a unos pasos, va a pasarla.
 function Tac.tryNearbyDoor(state, now)
+	if state.doorPass then return true end
 	local best, bestDist = nil, 9
 	for _, info in ipairs(Tac.doorList) do
 		local anchor = Tac.doorAnchor(info)
@@ -4711,7 +5175,11 @@ function Tac.tryNearbyDoor(state, now)
 			if dist < bestDist and not Tac.doorIsOpen(info) then best, bestDist = info, dist end
 		end
 	end
-	return best ~= nil and Tac.useDoor(state, now, best)
+	if not best then return false end
+	local dir = flat(Tac.doorAnchor(best) - state.root.Position)
+	if dir.Magnitude < 0.2 then return false end
+	Tac.startDoorPass(state, now, best, dir.Unit)
+	return state.doorPass ~= nil
 end
 
 --  Las puertas se registran solas cuando su script crea el BotTrigger.
@@ -4728,6 +5196,710 @@ task.delay(2, function()
 	end
 	dprint(#Tac.doorList .. " puertas registradas")
 end)
+
+-- --------------------------------------------------------------------------
+--  MEMORIA DEL MAPA [IA v3] (26/09)
+--
+--  Lugares a los que no se puede llegar: ningun camino llega, se atasco
+--  dos veces yendo, una puerta que no abre en el medio. La comparten TODOS
+--  los bots: lo que aprende uno lo saben los demas y nadie vuelve a
+--  intentarlo (ni a gastar calculos de camino). Hacen falta dos fallas para
+--  darlo por inalcanzable (una sola puede ser mala suerte); se olvida a los
+--  MemoryTime s y, si vuelve a fallar, se recuerda el doble (hasta
+--  MemoryMax). Llegar a un lugar lo borra. Se reinicia en cada fase.
+-- --------------------------------------------------------------------------
+Tac.navMemory = {}		-- [celda de 6 studs (Tac.memoryKey)] = { pos, fails, level, untilT, partialUntil }
+
+function Tac.memoryKey(x, y, z)
+	return ((x + 20000) * 40000 + (z + 20000)) * 1000 + (y + 500)		-- numero: sin armar textos
+end
+
+function Tac.markUnreachable(pos, weight, why, maxTime)
+	if not pos then return end
+	local AI = Tac.AI
+	local now = os.clock()
+	local key = Tac.memoryKey(math.floor(pos.X / 6), math.floor(pos.Y / 6), math.floor(pos.Z / 6))
+	local entry = Tac.navMemory[key]
+	if not entry then
+		entry = { pos = pos, fails = 0, level = 0, untilT = 0, partialUntil = 0 }
+		Tac.navMemory[key] = entry
+	end
+	if now > entry.partialUntil then entry.fails = 0 end
+	entry.fails += weight or 1
+	entry.partialUntil = now + AI.MemoryTime
+	if entry.fails >= 2 then
+		entry.fails = 0
+		entry.pos = pos
+		entry.untilT = now + math.min(AI.MemoryTime * 2 ^ entry.level, AI.MemoryMax, maxTime or math.huge)
+		entry.level = math.min(entry.level + 1, 5)
+		dprint(string.format("memoria: no se llega a (%.0f, %.0f, %.0f) [%s]", pos.X, pos.Y, pos.Z, why or "?"))
+	end
+end
+
+function Tac.isUnreachable(pos, radius)
+	if not pos or next(Tac.navMemory) == nil then return false end
+	local now = os.clock()
+	local range = radius or 5
+	local cx, cy, cz = math.floor(pos.X / 6), math.floor(pos.Y / 6), math.floor(pos.Z / 6)
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			for dz = -1, 1 do
+				local entry = Tac.navMemory[Tac.memoryKey(cx + dx, cy + dy, cz + dz)]
+				if entry and now < entry.untilT and flat(entry.pos - pos).Magnitude < range
+					and math.abs(entry.pos.Y - pos.Y) < 6 then
+					return true
+				end
+			end
+		end
+	end
+	return false
+end
+
+--  Alguien llego: ese lugar se puede alcanzar.
+function Tac.markReached(pos)
+	if not pos or next(Tac.navMemory) == nil then return end
+	local cx, cy, cz = math.floor(pos.X / 6), math.floor(pos.Y / 6), math.floor(pos.Z / 6)
+	for dx = -1, 1 do
+		for dy = -1, 1 do
+			for dz = -1, 1 do
+				local key = Tac.memoryKey(cx + dx, cy + dy, cz + dz)
+				local entry = Tac.navMemory[key]
+				if entry and (entry.pos - pos).Magnitude < 5 then Tac.navMemory[key] = nil end
+			end
+		end
+	end
+end
+
+--  Cada segundo (Heartbeat): mapa nuevo, memoria nueva.
+function Tac.memoryTick(now)
+	if now < (Tac.nextMemoryTick or 0) then return end
+	Tac.nextMemoryTick = now + 1
+	local phase = currentPhase()
+	if phase ~= Tac.memoryPhase then
+		Tac.memoryPhase = phase
+		Tac.navMemory = {}
+		for _, info in ipairs(Tac.doorList) do
+			if info.lockedUntil then Tac.unlockDoor(info) end
+		end
+	end
+end
+
+--  Un camino no salio con ningun agente. Si el destino esta mas alto y hay
+--  un borde que se pueda trepar, arma el plan para subir por ahi; si no, lo
+--  anota en la memoria (solo si el bot esta en un lugar normal: si ninguno
+--  de sus caminos sale, el problema es donde esta el, no el destino).
+function Tac.onPathFailed(state, goal, target, startPos, trusted)
+	local now = os.clock()
+	if state.climbPlan and target ~= goal then
+		--  Ni siquiera hay camino hasta el pie del borde.
+		state.climbPlan = nil
+		Tac.markUnreachable(goal, 1, "sin camino al borde")
+		return
+	end
+	if goal.Y - startPos.Y > 2.5 then
+		local plan = Tac.planClimb(state, goal)
+		if plan then
+			state.climbPlan = plan
+			state.lastRepath = now - 1		-- el proximo goTo ya va hacia el borde
+			dprint(state.bot.Name, string.format("sin camino para subir: trepara un borde de %.1f", plan.ledge))
+			return
+		end
+	end
+	if trusted and now - (state.lastPathOkAt or -100) < 40 then
+		--  Con una puerta trabada en el mapa, quizas sea por ella: se recuerda
+		--  solo hasta que la puerta vuelva a probarse.
+		local doorsBack = nil
+		for _, info in ipairs(Tac.doorList) do
+			if info.lockedUntil and info.lockedUntil > now then doorsBack = math.max(doorsBack or 0, info.lockedUntil - now) end
+		end
+		Tac.markUnreachable(goal, 1, doorsBack and "sin camino (puerta trabada)" or "sin camino", doorsBack)
+	end
+end
+
+-- --------------------------------------------------------------------------
+--  SUBIR A LUGARES ALTOS [IA v3] (26/09)
+--
+--  El navmesh no conoce el trepar (MantleMaxHeight). Si no hay camino a un
+--  lugar alto (techo bajo, contenedor, muro, balcon), se busca alrededor del
+--  destino un borde que no pase de esa altura, se va por camino al pie del
+--  borde y desde ahi se trepa.
+-- --------------------------------------------------------------------------
+function Tac.planClimb(state, goal)
+	local AI = Tac.AI
+	if AI.MantleMaxHeight <= 0 then return nil end
+	local now = os.clock()
+	if state.noClimbFor and now < (state.noClimbUntil or 0) and (goal - state.noClimbFor).Magnitude < 8 then return nil end
+	local params = Tac.moveParams
+	params.FilterDescendantsInstances = Tac.worldFilter()
+	local surface = workspace:Raycast(goal + Vector3.new(0, 3, 0), Vector3.new(0, -8, 0), params)
+	if not surface or surface.Normal.Y < 0.7 then return nil end
+	local topY = surface.Position.Y
+	local top = Vector3.new(goal.X, topY, goal.Z)
+	local origin = state.root.Position
+	local best, bestScore = nil, nil
+	for i = 0, 15 do
+		local angle = i * math.pi / 8
+		local dir = Vector3.new(math.cos(angle), 0, math.sin(angle))
+		--  Desde el destino hacia afuera hasta que se acaba el piso (el borde).
+		local edge = nil
+		for distance = 1.5, AI.ClimbSearch, 1.5 do
+			if workspace:Raycast(top + dir * (distance - 1.5) + Vector3.new(0, 2.5, 0), dir * 1.5, params) then break end
+			if not workspace:Raycast(top + dir * distance + Vector3.new(0, 1, 0), Vector3.new(0, -1.6, 0), params) then
+				edge = distance
+				break
+			end
+		end
+		if edge then
+			local outside = top + dir * (edge + 1.8)
+			local below = workspace:Raycast(outside + Vector3.new(0, 0.5, 0), Vector3.new(0, -(AI.MantleMaxHeight + 3), 0), params)
+			if below and below.Normal.Y > 0.7 then
+				local ledge = topY - below.Position.Y
+				local base = below.Position + dir * 0.6
+				local lip = top + dir * math.max(edge - 1.2, 0.5)
+				local roomBelow = not workspace:Raycast(below.Position + Vector3.new(0, 0.2, 0), Vector3.new(0, 5, 0), params)
+				local roomAbove = not workspace:Raycast(lip + Vector3.new(0, 0.2, 0), Vector3.new(0, 5, 0), params)
+				if ledge > 1.2 and ledge <= AI.MantleMaxHeight - 0.2 and roomBelow and roomAbove
+					and not Tac.isUnreachable(base) and not Tac.nearBlocked(state, base) then
+					local score = ledge * 2 + (base - origin).Magnitude * 0.05
+					if not bestScore or score < bestScore then
+						best = { base = base, lip = lip, topY = topY, top = goal, ledge = ledge }
+						bestScore = score
+					end
+				end
+			end
+		end
+	end
+	if best then best.untilT = now + 25 end
+	return best
+end
+
+--  Al pie del borde: derecho hacia el; el parkour trepa.
+function Tac.startClimb(state, now, plan)
+	state.climbing = { untilT = now + 5 }
+	state.waypoints = nil
+	state.detour = nil
+	state.moveMode = "direct"
+	state.directGoal = plan.lip
+	state.directUntil = now + 5
+	state.lastMoveTarget = nil
+	state.nextMantleAt, state.nextJumpAt = 0, 0
+	state.humanoid:MoveTo(plan.lip)
+	state.lastMoveToAt = now
+	dprint(state.bot.Name, string.format("trepa para llegar arriba (borde de %.1f)", plan.ledge))
+end
+
+--  Desde requestPath: a donde calcular el camino. nil = no calcular
+--  (esta trepando o acaba de empezar a trepar).
+function Tac.climbTarget(state, now, goal)
+	if state.climbing then
+		if now < state.climbing.untilT and state.moveMode == "direct" and state.directGoal then return nil end
+		state.climbing = nil
+	end
+	local plan = state.climbPlan
+	if not plan then return goal end
+	local root = state.root.Position
+	local feetY = root.Y - state.humanoid.HipHeight - state.root.Size.Y * 0.5
+	if now > plan.untilT or (goal - plan.top).Magnitude > 6 or feetY > plan.topY - 1 then
+		--  Otro destino, se vencio, o ya esta arriba: el plan termino.
+		state.climbPlan = nil
+		return goal
+	end
+	if flat(plan.base - root).Magnitude < 3 and math.abs(feetY - plan.base.Y) < 2.5 then
+		Tac.startClimb(state, now, plan)
+		return nil
+	end
+	return plan.base
+end
+
+-- --------------------------------------------------------------------------
+--  POSICIONES [IA v3] (26/09): segundos pisos, ventanas, colinas, techos
+--
+--  En vez de mirar solo el piso a su altura, cada punto de busqueda revisa
+--  TODOS los pisos de esa columna (suelo, segundo piso, azotea) y los
+--  califica contra la amenaza:
+--    · de pie la ve (puede disparar desde ahi);
+--    · agachado queda tapado por algo pegado (alfeizar, muro bajo, la cresta
+--      de una colina): un lugar para asomarse;
+--    · altura sobre la amenaza, techo encima (no lo ven desde arriba),
+--      paredes a los costados (sin ser un placard), distancia buena para su
+--      arma, que no haya un companero ya ahi, y lo que tarda en llegar.
+--  Los inalcanzables (memoria del mapa) ni se miran.
+-- --------------------------------------------------------------------------
+--  Pisos parados en la columna (x, z) entre topY y bottomY: uno debajo del
+--  otro. Un rayo que empieza dentro de una pieza no la ve, asi que se
+--  descartan los "pisos" que quedan dentro de algo solido.
+function Tac.scanFloors(x, z, topY, bottomY, out)
+	local y = topY
+	for _ = 1, 4 do
+		local hit = workspace:Raycast(Vector3.new(x, y, z), Vector3.new(0, bottomY - y, 0), Tac.params)
+		if not hit then return end
+		local pos = hit.Position
+		if hit.Normal.Y > 0.7 and not isSeeThrough(hit.Instance) then
+			local roomy = not workspace:Raycast(pos + Vector3.new(0, 0.2, 0), Vector3.new(0, 5, 0), Tac.params)
+			if roomy and #workspace:GetPartBoundsInRadius(pos + Vector3.new(0, 1.6, 0), 1.25, Tac.overlap) == 0 then
+				table.insert(out, pos)
+			end
+		end
+		if hit.Instance == workspace.Terrain then return end
+		y = pos.Y - 0.1
+		if y <= bottomY then return end
+	end
+end
+
+--  Arma principal: distancias buenas (con el multiplicador del tipo de IA).
+function Tac.weaponRanges(state)
+	local primary = state.weapons[(state.meta.loadout or Config.Loadout)[1]] or state.weapons[state.current]
+	local cfg = primary and primary.info.cfg
+	if not cfg then return 10, 80, 300 end
+	local mult = (state.meta.role and state.meta.role.RangeMult) or 1
+	return cfg.IdealMin * mult, cfg.IdealMax * mult, cfg.MaxRange
+end
+
+--  Llego a su puesto: cerca, o el camino ya termino y quedo a un par de pasos
+--  (un puesto pegado a algo puede quedar un poco fuera del navmesh y el
+--  camino no llega justo encima: antes iba y venia sin "llegar" nunca).
+function Tac.atPost(state, pos, radius)
+	local dist = flat(pos - state.root.Position).Magnitude
+	if dist <= radius then
+		state.finalStep = nil
+		return true
+	end
+	local now = os.clock()
+	local step = state.finalStep
+	--  Uno de otro puesto o que ya vencio no cuenta (si quedaba, el que llama
+	--  no volvia a pedir camino nunca).
+	if step and ((step.pos - pos).Magnitude >= 0.5 or now > step.untilT + 1) then
+		state.finalStep = nil
+		step = nil
+	end
+	if step then
+		--  Ultimo tramo derecho: si ni asi, se queda donde llego.
+		if now > step.untilT then
+			state.finalStep = nil
+			return true
+		end
+		return false
+	end
+	if dist <= radius + 4.5 and state.moveMode == "hold" and not state.pathBusy and now - (state.arrivedAt or -100) < 1.5 then
+		--  El camino termino a un par de pasos: el ultimo tramo, derecho.
+		state.finalStep = { pos = pos, untilT = now + 2 }
+		state.moveMode = "direct"
+		state.directGoal = pos
+		state.directUntil = now + 2
+		--  Como desvio: camina hasta el punto exacto (el "direct" se da por
+		--  llegado a 2.5 studs, y en una ventana eso ya es no ver por ella).
+		state.detour = { pos = pos, untilT = now + 1.6 }
+		state.lastMoveTarget = nil
+		state.humanoid:MoveTo(pos)
+		state.lastMoveToAt = now
+		return false
+	end
+	return false
+end
+
+--  Por donde deberia venir el enemigo: lo que oyo, lo que le avisaron, el
+--  ultimo que vio, el tiroteo que se oye, o por donde anda la gente.
+function Tac.threatGuess(state, now)
+	if state.noise and now - state.noise.at < 8 then return state.noise.pos end
+	local intel = Tac.intel(state, now)
+	if intel then return intel.pos end
+	if state.lastSeenPos and now - state.lastSeenAt < 15 then return state.lastSeenPos end
+	local hot = Tac.pickHotspot(state, now)
+	if hot then return hot.pos end
+	return Tac.enemyCenter(state)
+end
+
+--  Otro bot ya tomo un puesto ahi (no se amontonan).
+Tac.POST_KEYS = { "hold", "perch", "watch", "peek", "ambush" }
+function Tac.spotTaken(state, spot)
+	for _, other in pairs(brains) do
+		if other ~= state and not other.dead then
+			for _, key in ipairs(Tac.POST_KEYS) do
+				local post = other[key]
+				if post and post.pos and (post.pos - spot).Magnitude < 7 then return true end
+			end
+		end
+	end
+	return false
+end
+
+--  Puntaje de un lugar (nil = no sirve). ctx.threat es un punto a la altura
+--  del cuerpo del enemigo (raiz / de donde vino el tiro).
+function Tac.rateSpot(state, spot, ctx)
+	local params = Tac.params
+	local height = spot.Y - (ctx.threat.Y - 3)
+	if ctx.minHeight and height < ctx.minHeight then return nil end
+	local aim = ctx.threat + Vector3.new(0, 0.5, 0)
+	local standEye = spot + Vector3.new(0, 4.4, 0)		-- un poco bajo: con margen sobre un alfeizar
+	local toThreat = aim - standEye
+	local dist = toThreat.Magnitude
+	if ctx.maxRange and dist > ctx.maxRange then return nil end
+	if dist < (ctx.minThreatDist or 8) then return nil end		-- no encima de la amenaza
+	local hit = workspace:Raycast(standEye, toThreat, params)
+	local sees = not hit or (hit.Position - standEye).Magnitude > dist * 0.92 or isSeeThrough(hit.Instance)
+	if ctx.needView and not sees then return nil end
+	local score = sees and 30 or 0
+	--  Agachado (la cabeza baja ~1.9): tapado por algo a pocos pasos.
+	local crouchEye = spot + Vector3.new(0, 2.6, 0)
+	local low = workspace:Raycast(crouchEye, aim - crouchEye, params)
+	local coverDist = low and (low.Position - crouchEye).Magnitude or math.huge
+	local peek = coverDist < 7 and not isSeeThrough(low.Instance)
+	--  Pegado a la cobertura tapa mas angulo que a varios pasos de ella.
+	if peek then score += (ctx.peekWeight or 22) * (1.15 - coverDist / 14) end
+	score += math.clamp(height, -12, 30) * (ctx.heightWeight or 0.8)
+	if ctx.idealMin and dist < ctx.idealMin then score -= 15 end
+	if ctx.idealMax and dist > ctx.idealMax * 1.3 then score -= (dist - ctx.idealMax * 1.3) * 0.3 end
+	score -= (spot - state.root.Position).Magnitude * (ctx.travelWeight or 0.12)
+	if Tac.spotTaken(state, spot) then score -= 25 end
+	return score, sees, peek
+end
+
+--  Lo caro del puntaje (solo para los mejores de la lista): techo encima (no
+--  lo ven desde arriba) y paredes a los costados (sin ser un placard).
+function Tac.rateSpotExtras(spot, ctx)
+	local params = Tac.params
+	local score = 0
+	if workspace:Raycast(spot + Vector3.new(0, 5.2, 0), Vector3.new(0, 30, 0), params) then score += ctx.roofWeight or 6 end
+	local walls = 0
+	for k = 0, 5 do
+		local angle = k * math.pi / 3
+		if workspace:Raycast(spot + Vector3.new(0, 3, 0), Vector3.new(math.cos(angle), 0, math.sin(angle)) * 5, params) then
+			walls += 1
+		end
+	end
+	return score + (walls >= 6 and -15 or walls * 3)
+end
+
+--  Lugares alrededor de ctx.center (entre minRadius y maxRadius), mejores
+--  primero: { pos, score, sees, peek }.
+function Tac.findPositions(state, ctx)
+	local origin = state.root.Position
+	local center = ctx.center or origin
+	local rng = state.rng
+	local filter = Tac.worldFilter()
+	Tac.params.FilterDescendantsInstances = filter
+	Tac.overlap.FilterDescendantsInstances = filter
+	local top = math.max(origin.Y, center.Y) + (ctx.up or 30)
+	local bottom = math.min(origin.Y, center.Y) - (ctx.down or 25)
+	local floors, list = {}, {}
+	local interiors = {}		-- pisos bajo techo desde donde no se ve (ver abajo)
+	local function consider(spots)
+		for _, spot in ipairs(spots) do
+			if flat(spot - center).Magnitude <= (ctx.maxRadius or 40) + 4 and not Tac.isUnreachable(spot)
+				and not Tac.nearBlocked(state, spot) and Tac.climateOk(spot) then
+				local score, sees, peek = Tac.rateSpot(state, spot, ctx)
+				if score then
+					table.insert(list, { pos = spot, score = score, sees = sees, peek = peek, face = ctx.threat })
+				elseif ctx.threat and #interiors < 4
+					and workspace:Raycast(spot + Vector3.new(0, 5.2, 0), Vector3.new(0, 12, 0), Tac.params) then
+					table.insert(interiors, spot)
+				end
+			end
+		end
+	end
+	for _ = 1, ctx.samples or 24 do
+		local angle = rng:NextNumber(0, math.pi * 2)
+		local radius = rng:NextNumber(ctx.minRadius or 4, ctx.maxRadius or 40)
+		table.clear(floors)
+		Tac.scanFloors(center.X + math.cos(angle) * radius, center.Z + math.sin(angle) * radius, top, bottom, floors)
+		consider(floors)
+	end
+	--  Rayos DESDE la amenaza hacia la zona: si uno entra por una ventana y
+	--  pega adentro (o pega en la ladera de una colina), ese lugar la ve por
+	--  construccion. Al azar casi nunca se cae justo detras de una ventana.
+	local threat = ctx.threat
+	if threat and (ctx.sightRays or 20) > 0 then
+		local eye = threat + Vector3.new(0, 1.5, 0)
+		local toCenter = flat(center - eye)
+		local baseYaw = toCenter.Magnitude > 1 and math.atan2(toCenter.Z, toCenter.X) or rng:NextNumber(0, math.pi * 2)
+		local spread = toCenter.Magnitude > 1 and math.clamp(math.atan2(ctx.maxRadius or 40, toCenter.Magnitude), 0.3, math.pi) or math.pi
+		local reach = toCenter.Magnitude + (ctx.maxRadius or 40)
+		local across = math.max(toCenter.Magnitude, 12)
+		for _ = 1, ctx.sightRays or 20 do
+			local yaw = baseYaw + rng:NextNumber(-spread, spread)
+			--  Apuntando a alturas de 0 a 14 studs (planta baja, primer piso,
+			--  segundo piso) a la distancia de la zona.
+			local pitch = math.atan2(rng:NextNumber(-2, 14), across)
+			local dir = Vector3.new(math.cos(yaw) * math.cos(pitch), math.sin(pitch), math.sin(yaw) * math.cos(pitch))
+			local hit = workspace:Raycast(eye, dir * reach, Tac.params)
+			if hit then
+				--  Justo antes de lo que toco y unos pasos mas atras: si el rayo
+				--  entro por una ventana, pega al fondo del cuarto (desde donde el
+				--  alfeizar tapa); pegado a la ventana si se ve.
+				local travelled = (hit.Position - eye).Magnitude
+				for _, back in ipairs({ 1.8, 6 }) do
+					if back < travelled - 2 then
+						local point = hit.Position - dir * back
+						table.clear(floors)
+						Tac.scanFloors(point.X, point.Z, point.Y + 2, point.Y - 10, floors)
+						consider(floors)
+					end
+				end
+			end
+		end
+	end
+	--  Cobertura delante: rayos desde el lugar hacia la amenaza a la altura de
+	--  alguien agachado; lo que tocan (un muro bajo, un auto, una cresta) tapa,
+	--  y el lugar justo detras es para asomarse.
+	if threat and ctx.coverRays then
+		local root = state.root.Position
+		local from = Vector3.new(center.X, root.Y - 3 + 2.2, center.Z)
+		local toward = flat(threat - from)
+		if toward.Magnitude > 4 then
+			local baseYaw = math.atan2(toward.Z, toward.X)
+			for i = 1, ctx.coverRays do
+				local yaw = baseYaw + (i - (ctx.coverRays + 1) / 2) * (1.6 / ctx.coverRays)
+				local dir = Vector3.new(math.cos(yaw), 0, math.sin(yaw))
+				local hit = workspace:Raycast(from, dir * (ctx.maxRadius or 22), Tac.params)
+				if hit and hit.Normal.Y < 0.5 and not isSeeThrough(hit.Instance) then
+					for _, back in ipairs({ 1.3, 2.6 }) do
+						local point = hit.Position - dir * back
+						table.clear(floors)
+						Tac.scanFloors(point.X, point.Z, point.Y + 3, point.Y - 6, floors)
+						consider(floors)
+					end
+				end
+			end
+		end
+	end
+	--  Adentro de un edificio y sin ver nada: como una persona, a la pared que
+	--  da hacia la amenaza y a lo largo de ella, buscando una ventana.
+	if threat then
+		local checked = interiors
+		interiors = { true, true, true, true }		-- no juntar mas mientras tanto
+		for _, spot in ipairs(checked) do
+			local toThreat = flat(threat - spot)
+			if toThreat.Magnitude > 4 then
+				local dir = toThreat.Unit
+				local wall = workspace:Raycast(spot + Vector3.new(0, 3, 0), dir * 40, Tac.params)
+				if wall and math.abs(wall.Normal.Y) < 0.3 then
+					local base = wall.Position - dir * 1.4
+					local perp = Vector3.new(-dir.Z, 0, dir.X)
+					for _, slide in ipairs({ 0, 2.5, -2.5, 5, -5, 7.5, -7.5 }) do
+						local point = base + perp * slide
+						table.clear(floors)
+						Tac.scanFloors(point.X, point.Z, spot.Y + 2, spot.Y - 1, floors)
+						consider(floors)
+					end
+				end
+			end
+		end
+	end
+	table.sort(list, function(a, b) return a.score > b.score end)
+	--  Techo y paredes solo para los mejores (son 7 rayos por lugar).
+	local refine = math.min(#list, 8)
+	for i = 1, refine do
+		list[i].score += Tac.rateSpotExtras(list[i].pos, ctx)
+	end
+	if refine > 1 then
+		local top = table.move(list, 1, refine, 1, {})
+		table.sort(top, function(a, b) return a.score > b.score end)
+		table.move(top, 1, refine, 1, list)
+	end
+	return list
+end
+
+--  En segundo plano: el primero de la lista al que hay camino COMPLETO (un
+--  techo por fuera o un balcon sin escalera no pasan). Los que no, a la
+--  memoria. Cada calculo paga del presupuesto global.
+function Tac.validateSpots(state, list, maxChecks, onFound)
+	if state.spotChecking then return end
+	state.spotChecking = true
+	task.spawn(function()
+		--  Agente angosto y con saltos: el mas permisivo (escaleras angostas).
+		state.pathProbe = state.pathProbe or PathfindingService:CreatePath(Tac.tightAgent)
+		local path = state.pathProbe
+		for index = 1, math.min(#list, maxChecks) do
+			if not isAlive(state) then break end
+			local waited = 0
+			while not Tac.takePathToken("perch") and waited < 5 do
+				waited += task.wait(0.25)
+			end
+			if not isAlive(state) then break end
+			local candidate = list[index]
+			local ok = pcall(function() path:ComputeAsync(state.root.Position, candidate.pos) end)
+			if ok and path.Status == Enum.PathStatus.Success then
+				local waypoints = path:GetWaypoints()
+				local last = waypoints[#waypoints]
+				if last and flat(last.Position - candidate.pos).Magnitude < 4 and math.abs(last.Position.Y - candidate.pos.Y) < 3 then
+					onFound(candidate)
+					break
+				end
+			end
+			Tac.markUnreachable(candidate.pos, 1, "sin camino al puesto")
+		end
+		state.spotChecking = false
+	end)
+end
+
+--  Desde lejos, hacia un tiroteo: un lugar desde donde se lo ve (alto, con
+--  cobertura) en vez de meterse en el medio.
+function Tac.findOverwatch(state, spot)
+	local idealMin, idealMax, maxRange = Tac.weaponRanges(state)
+	local list = Tac.findPositions(state, { threat = spot, center = spot, minRadius = 20, maxRadius = math.max(30, math.min(60, maxRange * 0.8)),
+		needView = true, samples = 16, heightWeight = 1, travelWeight = 0.04,
+		idealMin = idealMin, idealMax = idealMax, maxRange = maxRange })
+	return list[1] and list[1].pos or nil
+end
+
+--  Camper: un punto alto con vista, mirando todos los pisos (una ventana
+--  del segundo piso, una azotea con escalera, la cima de una colina).
+function Tac.findPerchV3(state)
+	if not Tac.AI.SmartPositions then return {} end
+	local role = state.meta.role
+	local threat = Tac.threatGuess(state, os.clock())
+	if not threat then return {} end
+	local idealMin, idealMax, maxRange = Tac.weaponRanges(state)
+	local list = Tac.findPositions(state, { threat = threat, center = state.root.Position, minRadius = 8,
+		maxRadius = role.PerchSearch or 110, samples = 30, up = 45, down = 20, needView = true,
+		minHeight = role.MinHeight or 6, heightWeight = 1.5, peekWeight = 25, travelWeight = 0.08,
+		idealMin = idealMin, idealMax = idealMax, maxRange = maxRange })
+	local out = {}
+	for _, candidate in ipairs(list) do
+		if not Tac.isBadPerch(state, candidate.pos)
+			and not (state.lastPerch and (state.lastPerch - candidate.pos).Magnitude < 12) then
+			table.insert(out, { pos = candidate.pos, face = threat, score = candidate.score, peek = candidate.peek })
+		end
+	end
+	return out
+end
+
+-- --------------------------------------------------------------------------
+--  ASOMARSE [IA v3] (26/09): pelea a distancia desde un lugar con cobertura
+--
+--  Peleando a media / larga distancia al descubierto, busca cerca un lugar
+--  donde de pie ve al enemigo y agachado queda tapado (una ventana, un muro
+--  bajo, la cresta de una colina). Ahi se asoma a disparar y se agacha a
+--  ratos, para recargar y cuando le pegan. Se va si se le acercan, si lo
+--  flanquean (le pegan agachado) o si pierde al enemigo.
+-- --------------------------------------------------------------------------
+function Tac.considerPeek(state, now, target, dist)
+	local AI = Tac.AI
+	if AI.PeekChance <= 0 or state.peek or state.cover or now < (state.nextPeekTry or 0) then return false end
+	local role = state.meta.role
+	local kind = role and role.Kind
+	if kind == "Corredora" or kind == "Sigiloso" then return false end
+	local _, _, maxRange = Tac.weaponRanges(state)
+	if dist < AI.PeekMinDistance or dist > maxRange then return false end
+	state.nextPeekTry = now + state.rng:NextNumber(4, 7)
+	local recentlyHit = state.lastDamageAt ~= nil and now - state.lastDamageAt < 3
+	if not recentlyHit and state.rng:NextNumber() > AI.PeekChance then return false end
+	local threat = target.root.Position
+	local list = Tac.findPositions(state, { threat = threat, center = state.root.Position, minRadius = 0, maxRadius = AI.PeekRange,
+		needView = true, samples = 14, up = 12, down = 12, heightWeight = 0.4, peekWeight = 40, roofWeight = 3,
+		travelWeight = 0.7, maxRange = maxRange, coverRays = 12, sightRays = 12 })
+	local best = nil
+	for _, candidate in ipairs(list) do
+		if candidate.peek then
+			best = candidate
+			break
+		end
+	end
+	if not best then return false end
+	state.peek = { pos = best.pos, threat = threat, arrived = false, untilT = now + state.rng:NextNumber(14, 24),
+		phase = "up", phaseUntil = 0, peek = true }
+	dprint(state.bot.Name, "va a un lugar para asomarse a pelear")
+	return true
+end
+
+--  true si asomarse se hizo cargo del movimiento en esta vuelta.
+function Tac.updatePeek(state, now)
+	local peek = state.peek
+	if not peek then return false end
+	local target = state.target
+	local hitRecently = state.lastDamageAt ~= nil and now - state.lastDamageAt < 1.2
+	local enemyClose = target ~= nil and state.visible and (target.root.Position - state.root.Position).Magnitude < 12
+	local flanked = peek.arrived and peek.phase == "down" and hitRecently
+	if state.cover or now > peek.untilT or enemyClose or flanked or now - state.lastSeenAt > 7 then
+		state.peek = nil
+		state.nextPeekTry = now + (flanked and 6 or 3)
+		return false
+	end
+	if state.visible and target then peek.threat = target.root.Position end
+	local dist = flat(peek.pos - state.root.Position).Magnitude
+	if not peek.arrived then
+		if not Tac.atPost(state, peek.pos, 1.6) then
+			if not state.finalStep then Tac.goTo(state, now, peek.pos, "cover", RUN_SPEED, 2) end
+			if state.pathFails >= 2 then
+				state.peek = nil
+				state.pathFails = 0
+				state.nextPeekTry = now + 5
+				return false
+			end
+			return true
+		end
+		peek.arrived = true
+		peek.phase, peek.phaseUntil = "up", now + state.rng:NextNumber(1.5, 3)
+	elseif dist > 5 then
+		peek.arrived = false
+		return true
+	end
+	if state.moveMode ~= "hold" then stopWalking(state) end
+	--  Arriba un rato (dispara), abajo otro (se tapa).
+	if now >= peek.phaseUntil then
+		if peek.phase == "up" then
+			peek.phase, peek.phaseUntil = "down", now + state.rng:NextNumber(0.7, 1.5)
+		else
+			peek.phase, peek.phaseUntil = "up", now + state.rng:NextNumber(1.6, 3.2)
+		end
+	end
+	if not state.visible then
+		state.lookAt = peek.threat
+		state.lookUntil = now + 0.4
+	end
+	return true
+end
+
+--  En un puesto (defensiva, estratega, camper, asomarse): agachado o no.
+--  Un puesto "para asomarse" solo se agacha para recargar o si le pegan
+--  (agachado no ve nada); los demas, agachados siempre.
+function Tac.postCrouch(state, post, now)
+	if not post.peek then return true end
+	if post == state.peek and post.phase == "down" then return true end
+	return state.reload ~= nil or (state.lastDamageAt ~= nil and now - state.lastDamageAt < 1.2)
+end
+
+-- --------------------------------------------------------------------------
+--  ESPERAR ABAJO [IA v3] (26/09)
+--
+--  El que se perdio de vista esta donde no se puede llegar (un techo, una
+--  torre, un balcon sin escalera): en vez de ir y rendirse, se pone donde se
+--  ve ese lugar y lo espera un rato, por si se asoma o baja.
+-- --------------------------------------------------------------------------
+function Tac.startAmbush(state, now, spot)
+	if now < (state.nextAmbushAt or 0) then return false end
+	state.nextAmbushAt = now + 20
+	local list = Tac.findPositions(state, { threat = spot, center = state.root.Position, minRadius = 3, maxRadius = 30,
+		needView = true, samples = 16, heightWeight = 0.3, peekWeight = 15 })
+	local best = list[1]
+	if not best then return false end
+	state.ambush = { pos = best.pos, look = spot, untilT = now + state.rng:NextNumber(8, 15), peek = best.peek, arrived = false }
+	dprint(state.bot.Name, "no puede llegar hasta ahi: lo espera donde lo ve")
+	return true
+end
+
+function Tac.ambushStep(state, now)
+	local ambush = state.ambush
+	if not ambush then return false end
+	if now > ambush.untilT or state.visible then
+		state.ambush = nil
+		return false
+	end
+	local dist = flat(ambush.pos - state.root.Position).Magnitude
+	if not ambush.arrived and not Tac.atPost(state, ambush.pos, ambush.peek and 1.6 or 3) then
+		if not state.finalStep then Tac.goTo(state, now, ambush.pos, "watch", WALK_SPEED, 3) end
+		if state.pathFails >= 3 then
+			state.ambush = nil
+			return false
+		end
+	else
+		ambush.arrived = true
+		if state.moveMode ~= "hold" then stopWalking(state) end
+	end
+	state.lookAt = ambush.look + Vector3.new(0, 1.5, 0)
+	state.lookUntil = now + 0.5
+	return true
+end
 
 -- --------------------------------------------------------------------------
 --  NADAR (23/09 noche)
@@ -5036,13 +6208,20 @@ function Tac.camp(state, now)
 		state.pathFails = 0
 	end
 	if not perch then
-		if state.perchSearching or now < (state.nextPerchPick or 0) then return false end
+		if state.perchSearching then
+			--  [IA v3] Comprobando caminos a los puntos altos: quieto un momento.
+			if state.moveMode ~= "hold" then stopWalking(state) end
+			return true
+		end
+		if now < (state.nextPerchPick or 0) then return false end
 		state.nextPerchPick = now + 3
 		local choke = state.rng:NextNumber() < (role.ChokeChance or 0.35)
 		local list = choke and Tac.findChokeHold(state) or {}
 		if #list == 0 then
 			choke = false
-			list = Tac.findPerch(state)
+			--  [IA v3] Mirando todos los pisos; el viejo si no encuentra nada.
+			list = Tac.findPerchV3(state)
+			if #list == 0 then list = Tac.findPerch(state) end
 		end
 		if #list == 0 then return false end
 		--  [24/09] Antes de elegir, que haya camino COMPLETO hasta el punto
@@ -5052,7 +6231,10 @@ function Tac.camp(state, now)
 		task.spawn(function()
 			--  [IA v2] Un solo Path por bot (antes uno nuevo en cada busqueda) y
 			--  cada calculo paga del presupuesto global (espera si no alcanza).
-			state.pathProbe = state.pathProbe or PathfindingService:CreatePath({ AgentRadius = 1.8, AgentHeight = 5.4, AgentCanJump = true, AgentCanClimb = true, WaypointSpacing = 5 })
+			--  [IA v3] Con el agente angosto (como Tac.validateSpots): con el
+			--  ancho, las escaleras angostas daban "sin camino" y el punto alto
+			--  de un segundo piso quedaba descartado.
+			state.pathProbe = state.pathProbe or PathfindingService:CreatePath(Tac.tightAgent)
 			local path = state.pathProbe
 			for index = 1, math.min(#list, 6) do
 				if not isAlive(state) or state.perch then break end
@@ -5067,7 +6249,7 @@ function Tac.camp(state, now)
 					local waypoints = path:GetWaypoints()
 					local last = waypoints[#waypoints]
 					if last and flat(last.Position - candidate.pos).Magnitude < 4 and math.abs(last.Position.Y - candidate.pos.Y) < 3 then
-						state.perch = { pos = candidate.pos, face = candidate.face, choke = choke, arrived = false,
+						state.perch = { pos = candidate.pos, face = candidate.face, choke = choke, arrived = false, peek = candidate.peek,
 							untilT = os.clock() + rangeNumber(state.rng, role.PerchTime or { 20, 45 }) }
 						state.pathFails = 0
 						dprint(state.bot.Name, choke and "va a holdear una entrada" or "va a un punto alto")
@@ -5077,6 +6259,7 @@ function Tac.camp(state, now)
 				state.badPerches = state.badPerches or {}
 				table.insert(state.badPerches, candidate.pos)
 				if #state.badPerches > 16 then table.remove(state.badPerches, 1) end
+				Tac.markUnreachable(candidate.pos, 1, "sin camino al punto alto")		-- [IA v3]
 			end
 			state.perchSearching = false
 		end)
@@ -5087,7 +6270,7 @@ function Tac.camp(state, now)
 	if Config.Debug then
 		state.character:SetAttribute("BotCamp", string.format("%s a %.0f studs (dy %.0f)", perch.arrived and "en su punto" or "yendo", dist, dy))
 	end
-	if dist > 3 or dy > 4 then
+	if (dist > 3 or dy > 4) and not (dy <= 4 and Tac.atPost(state, perch.pos, perch.peek and 1.6 or 3)) then
 		perch.arrived = false
 		Tac.goTo(state, now, perch.pos, "perch", dist > 30 and RUN_SPEED or WALK_SPEED, 3)
 		return true
@@ -5512,7 +6695,9 @@ local function stepBrain(state, now, dt)
 	updateFire(state, now)
 	--  [tacticas] Barrida en curso: ella mueve el cuerpo; si no, el camino.
 	--  [23/09 noche] Abriendo una puerta: quieto hasta que termine de girar.
-	if now >= (state.doorWaitUntil or 0) and not (Tac.updateSlide and Tac.updateSlide(state, now)) then
+	--  [IA v3] Pasando una puerta: quieto mientras abre.
+	local doorHold = Tac.doorStep and Tac.doorStep(state, now)
+	if not doorHold and now >= (state.doorWaitUntil or 0) and not (Tac.updateSlide and Tac.updateSlide(state, now)) then
 		stepMovement(state, now)
 		--  [IA v2] Saltar, trepar, cruzar huecos, esquivar.
 		if Tac.parkour then Tac.parkour(state, now) end
@@ -5527,6 +6712,8 @@ RunService.Heartbeat:Connect(function(dt)
 	local now = os.clock()
 	--  [IA v2] Recarga del presupuesto de caminos (ver Tac.takePathToken).
 	Tac.pathTokens = math.min(Tac.AI.PathBurst, Tac.pathTokens + dt * Tac.AI.PathBudget)
+	--  [IA v3] Memoria del mapa: se reinicia con cada fase (mapa nuevo).
+	if Tac.memoryTick then Tac.memoryTick(now) end
 	for _, state in pairs(brains) do
 		if not state.dead then
 			local ok, err = pcall(stepBrain, state, now, dt)
