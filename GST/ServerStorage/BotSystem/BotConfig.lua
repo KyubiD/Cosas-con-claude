@@ -97,11 +97,136 @@ BotConfig.Avatar = {
 		{ Head = Color3.fromRGB(234, 184, 146), Torso = Color3.fromRGB(27, 42, 53), Legs = Color3.fromRGB(99, 95, 98) },
 	},
 
+	--  [25/09] Sin el amarillo "noob" (ese queda solo en los Classic) para que
+	--  los bots se vean mas humanos.
 	SkinTones = {
-		Color3.fromRGB(255, 204, 153), Color3.fromRGB(234, 184, 146), Color3.fromRGB(204, 142, 105),
-		Color3.fromRGB(175, 125, 95), Color3.fromRGB(124, 92, 70), Color3.fromRGB(86, 66, 54),
-		Color3.fromRGB(245, 205, 48),
+		Color3.fromRGB(255, 219, 172), Color3.fromRGB(255, 204, 153), Color3.fromRGB(234, 184, 146),
+		Color3.fromRGB(224, 172, 128), Color3.fromRGB(204, 142, 105), Color3.fromRGB(175, 125, 95),
+		Color3.fromRGB(141, 101, 76), Color3.fromRGB(124, 92, 70), Color3.fromRGB(86, 66, 54),
 	},
+
+	--======================================================================
+	--  ESTILOS  [25/09]  (uno al azar por bot, con estos pesos)
+	--
+	--  El uniforme es el color del cuerpo con textura de tela y el equipo
+	--  son piezas pegadas al cuerpo (no hace falta ningun ID del catalogo).
+	--  Las piezas no chocan ni frenan balas: la hitbox es la de siempre.
+	--
+	--  Kind      "Militar", "Civil" o "Clasico" (el avatar liso de antes).
+	--  Top / Bottom   colores de la parte de arriba (torso y mangas) y de
+	--                 las piernas. Uno al azar de cada lista.
+	--  Camo      colores de las manchas de camuflaje (vacio = liso).
+	--  Vest      color del chaleco / mochila / cinturon (y del casco si no
+	--            hay HeadgearColors).
+	--  Headgear  { Tipo = peso }: Casco, Gorra, Gorro, Boonie, Boina, Ninguno.
+	--  Gear      probabilidad (0-1) de cada pieza: Chaleco, Mochila,
+	--            Cinturon, Rodilleras, Guantes, Pasamontanas, Bufanda,
+	--            Auriculares, Gafas, VisionNocturna (soporte en el casco).
+	--  Gloves / Boots / MaskColors / ScarfColors   colores de esas piezas.
+	--  HairChance     pelo (solo si no lleva nada en la cabeza).
+	--  Civil: CatalogChance = prob. de usar Shirts/Pants de arriba en vez
+	--         de ropa lisa; ShortSleeveChance = remera de manga corta.
+	--======================================================================
+	Styles = {
+		{ Name = "Civil", Kind = "Civil", Weight = 26,
+			CatalogChance = 0.45, ShortSleeveChance = 0.55, HairChance = 0.85,
+			Top = {
+				Color3.fromRGB(35, 35, 38), Color3.fromRGB(235, 235, 235), Color3.fromRGB(120, 30, 35),
+				Color3.fromRGB(40, 60, 110), Color3.fromRGB(95, 95, 100), Color3.fromRGB(70, 90, 60),
+				Color3.fromRGB(190, 160, 120), Color3.fromRGB(150, 60, 30), Color3.fromRGB(60, 45, 80),
+				Color3.fromRGB(230, 200, 90), Color3.fromRGB(45, 110, 120),
+			},
+			Bottom = {
+				Color3.fromRGB(45, 60, 95), Color3.fromRGB(60, 80, 120), Color3.fromRGB(30, 30, 32),
+				Color3.fromRGB(170, 150, 115), Color3.fromRGB(85, 85, 90), Color3.fromRGB(70, 60, 50),
+			},
+			Boots = { Color3.fromRGB(240, 240, 240), Color3.fromRGB(25, 25, 25), Color3.fromRGB(110, 75, 50), Color3.fromRGB(90, 90, 95) },
+			Vest = { Color3.fromRGB(30, 30, 30), Color3.fromRGB(150, 40, 40), Color3.fromRGB(40, 70, 120), Color3.fromRGB(110, 110, 110) },
+			Headgear = { Ninguno = 6, Gorra = 3, Gorro = 1 },
+			Gear = { Mochila = 0.2, Auriculares = 0.12, Gafas = 0.15, Guantes = 0.05 },
+			Gloves = { Color3.fromRGB(30, 30, 30) },
+		},
+		{ Name = "Clasico", Kind = "Clasico", Weight = 5 },
+
+		{ Name = "Bosque", Kind = "Militar", Weight = 12, HairChance = 0.3,
+			Top = { Color3.fromRGB(85, 94, 54), Color3.fromRGB(74, 83, 52), Color3.fromRGB(92, 98, 66) },
+			Bottom = { Color3.fromRGB(78, 85, 55), Color3.fromRGB(66, 72, 48) },
+			Camo = { Color3.fromRGB(46, 54, 34), Color3.fromRGB(96, 78, 52), Color3.fromRGB(32, 34, 28), Color3.fromRGB(112, 120, 80) },
+			Vest = { Color3.fromRGB(66, 75, 48), Color3.fromRGB(80, 84, 60), Color3.fromRGB(58, 62, 44) },
+			Headgear = { Casco = 5, Boonie = 3, Gorra = 1, Ninguno = 1 },
+			Gear = { Chaleco = 0.85, Mochila = 0.45, Cinturon = 0.9, Rodilleras = 0.55, Guantes = 0.6, Pasamontanas = 0.08,
+				Bufanda = 0.2, Auriculares = 0.3, Gafas = 0.25, VisionNocturna = 0.1 },
+			Gloves = { Color3.fromRGB(40, 40, 36), Color3.fromRGB(70, 62, 48) },
+			Boots = { Color3.fromRGB(40, 34, 28), Color3.fromRGB(28, 28, 28) },
+			ScarfColors = { Color3.fromRGB(60, 66, 44), Color3.fromRGB(90, 80, 60) },
+			MaskColors = { Color3.fromRGB(45, 50, 38) },
+		},
+		{ Name = "Nieve", Kind = "Militar", Weight = 8, HairChance = 0.2,
+			Top = { Color3.fromRGB(235, 238, 240), Color3.fromRGB(220, 224, 228), Color3.fromRGB(205, 210, 214) },
+			Bottom = { Color3.fromRGB(225, 228, 232), Color3.fromRGB(200, 205, 210) },
+			Camo = { Color3.fromRGB(170, 178, 186), Color3.fromRGB(140, 148, 156), Color3.fromRGB(250, 250, 250) },
+			Vest = { Color3.fromRGB(210, 214, 218), Color3.fromRGB(190, 195, 200), Color3.fromRGB(150, 155, 160) },
+			HeadgearColors = { Color3.fromRGB(235, 235, 235), Color3.fromRGB(200, 205, 210), Color3.fromRGB(90, 95, 100) },
+			Headgear = { Casco = 4, Gorro = 4, Ninguno = 1 },
+			Gear = { Chaleco = 0.7, Mochila = 0.5, Cinturon = 0.8, Rodilleras = 0.4, Guantes = 0.85, Pasamontanas = 0.35,
+				Bufanda = 0.5, Auriculares = 0.2, Gafas = 0.35 },
+			Gloves = { Color3.fromRGB(60, 62, 66), Color3.fromRGB(230, 230, 230) },
+			Boots = { Color3.fromRGB(50, 50, 52), Color3.fromRGB(210, 210, 210) },
+			ScarfColors = { Color3.fromRGB(240, 240, 240), Color3.fromRGB(170, 175, 180) },
+			MaskColors = { Color3.fromRGB(240, 240, 240), Color3.fromRGB(190, 195, 200) },
+		},
+		{ Name = "Desierto", Kind = "Militar", Weight = 9, HairChance = 0.3,
+			Top = { Color3.fromRGB(194, 170, 125), Color3.fromRGB(180, 155, 110), Color3.fromRGB(205, 185, 140) },
+			Bottom = { Color3.fromRGB(185, 160, 115), Color3.fromRGB(170, 148, 105) },
+			Camo = { Color3.fromRGB(150, 120, 80), Color3.fromRGB(215, 195, 150), Color3.fromRGB(130, 105, 70) },
+			Vest = { Color3.fromRGB(175, 150, 105), Color3.fromRGB(160, 140, 100), Color3.fromRGB(120, 110, 80) },
+			Headgear = { Casco = 4, Boonie = 3, Gorra = 2, Ninguno = 1 },
+			Gear = { Chaleco = 0.8, Mochila = 0.4, Cinturon = 0.9, Rodilleras = 0.6, Guantes = 0.5, Pasamontanas = 0.05,
+				Bufanda = 0.55, Auriculares = 0.3, Gafas = 0.45 },
+			Gloves = { Color3.fromRGB(120, 95, 65), Color3.fromRGB(60, 55, 48) },
+			Boots = { Color3.fromRGB(140, 110, 75), Color3.fromRGB(95, 75, 55) },
+			ScarfColors = { Color3.fromRGB(200, 185, 150), Color3.fromRGB(110, 120, 90), Color3.fromRGB(60, 60, 60) },
+		},
+		{ Name = "Nocturno", Kind = "Militar", Weight = 9, HairChance = 0.15,
+			Top = { Color3.fromRGB(28, 30, 32), Color3.fromRGB(38, 40, 44), Color3.fromRGB(22, 24, 28) },
+			Bottom = { Color3.fromRGB(32, 34, 38), Color3.fromRGB(26, 28, 30) },
+			Camo = {},
+			Vest = { Color3.fromRGB(20, 20, 22), Color3.fromRGB(45, 48, 40), Color3.fromRGB(35, 38, 45) },
+			Headgear = { Casco = 6, Gorra = 1, Gorro = 1 },
+			Gear = { Chaleco = 0.95, Mochila = 0.25, Cinturon = 0.9, Rodilleras = 0.7, Guantes = 0.9, Pasamontanas = 0.5,
+				Auriculares = 0.6, Gafas = 0.2, VisionNocturna = 0.45 },
+			Gloves = { Color3.fromRGB(20, 20, 20) },
+			Boots = { Color3.fromRGB(20, 20, 20) },
+			MaskColors = { Color3.fromRGB(22, 22, 24) },
+		},
+		{ Name = "Urbano", Kind = "Militar", Weight = 9, HairChance = 0.3,
+			Top = { Color3.fromRGB(95, 100, 108), Color3.fromRGB(120, 124, 130), Color3.fromRGB(70, 74, 80) },
+			Bottom = { Color3.fromRGB(80, 84, 90), Color3.fromRGB(60, 62, 68) },
+			Camo = { Color3.fromRGB(50, 52, 58), Color3.fromRGB(150, 152, 158), Color3.fromRGB(35, 36, 40) },
+			Vest = { Color3.fromRGB(60, 62, 66), Color3.fromRGB(40, 42, 46) },
+			Headgear = { Casco = 4, Gorra = 2, Gorro = 1, Ninguno = 1 },
+			Gear = { Chaleco = 0.85, Mochila = 0.3, Cinturon = 0.85, Rodilleras = 0.6, Guantes = 0.7, Pasamontanas = 0.2,
+				Bufanda = 0.15, Auriculares = 0.45, Gafas = 0.3, VisionNocturna = 0.15 },
+			Gloves = { Color3.fromRGB(30, 30, 30) },
+			Boots = { Color3.fromRGB(25, 25, 25), Color3.fromRGB(60, 50, 40) },
+			MaskColors = { Color3.fromRGB(30, 30, 32), Color3.fromRGB(80, 84, 90) },
+		},
+		--  Contratista: ropa de civil (remera, caqui, jeans) con equipo tactico.
+		{ Name = "Contratista", Kind = "Militar", Weight = 8, HairChance = 0.6, ShortSleeveChance = 0.5,
+			Top = { Color3.fromRGB(40, 40, 40), Color3.fromRGB(90, 90, 95), Color3.fromRGB(50, 70, 90), Color3.fromRGB(150, 135, 110), Color3.fromRGB(225, 225, 225) },
+			Bottom = { Color3.fromRGB(170, 150, 115), Color3.fromRGB(60, 62, 66), Color3.fromRGB(55, 60, 80) },
+			Camo = {},
+			Vest = { Color3.fromRGB(170, 150, 110), Color3.fromRGB(60, 65, 50), Color3.fromRGB(30, 30, 30) },
+			Headgear = { Gorra = 5, Ninguno = 3, Casco = 1 },
+			Gear = { Chaleco = 0.9, Mochila = 0.3, Cinturon = 0.8, Rodilleras = 0.3, Guantes = 0.6, Auriculares = 0.6, Gafas = 0.45 },
+			Gloves = { Color3.fromRGB(150, 130, 100), Color3.fromRGB(30, 30, 30) },
+			Boots = { Color3.fromRGB(120, 95, 70), Color3.fromRGB(30, 30, 30) },
+		},
+	},
+	--  Tope de piezas de equipo por bot (rendimiento con muchos bots).
+	MaxGearParts = 40,
+	--  Manchas de camuflaje por bot (0 = uniforme liso).
+	CamoPatches = 6,
 }
 
 --==========================================================================
@@ -431,6 +556,32 @@ BotConfig.SpawnProtection = {
 	Enabled = true,
 	MoveStuds = 7.14,
 	MaxSeconds = 8,
+}
+
+--==========================================================================
+--  IA v2  [25/09]  (parkour, oido, caminos, encierros, rendimiento)
+--
+--  Todo tiene un valor por defecto dentro de BotServer (tabla Tac.AI).
+--  Cualquier clave que pongas aqui lo reemplaza; las que no pongas quedan
+--  igual. Las mas utiles:
+--
+--    MantleMaxHeight   bordes hasta esta altura se trepan (6.5; 0 = nunca).
+--                      Un jugador con JumpPower 25 sube ~3.3: con 3.3 los
+--                      bots quedan parejos con los jugadores.
+--    GapMax            huecos hasta este largo se saltan (8; 0 = nunca).
+--    HotspotRange      de tan lejos oyen un tiroteo y van hacia el (480).
+--    FootstepRange     pasos corriendo; caminando ~45 % de esto (42).
+--    WeatherTolerance  s a la intemperie antes de buscar techo (8).
+--    WeatherFightRange con un enemigo a menos de esto pelea igual (70).
+--    JumpLoopLimit     saltos en el mismo lugar antes de rendirse (5).
+--    ConfinedTime      s sin salir de un lugar antes de explorar (10).
+--    WindowEscapeAfter exploraciones antes de salir por una ventana (2).
+--    PathBudget        calculos de camino por segundo entre todos (14).
+--    LodDistance       sin jugadores reales a esto piensan mas lento (260).
+--==========================================================================
+BotConfig.AI = {
+	-- MantleMaxHeight = 6.5,
+	-- GapMax = 8,
 }
 
 return BotConfig

@@ -329,10 +329,17 @@ local DEFAULT_ANIMS = {
 	swimidle = "rbxassetid://913389285",
 }
 
-local function buildDescription(rng)
+local function buildDescription(rng, role)
 	local A = Config.Avatar
 	local desc = Instance.new("HumanoidDescription")
-	if A.Classic and #A.Classic > 0 and rng:NextNumber() < (A.ClassicChance or 0) then
+	--  [aspecto 25/09] Con Avatar.Styles: un estilo al azar (militar de bosque,
+	--  nieve, desierto, nocturno, urbano, contratista, civil...). Devuelve
+	--  tambien "look": lo que Tac.dressModel le pone encima (casco, chaleco...).
+	local style = Tac.pickStyle and Tac.pickStyle(A, rng)
+	if style and style.Kind ~= "Clasico" then
+		return desc, Tac.styleDescription(desc, A, style, rng, role)
+	end
+	if style or (A.Classic and #A.Classic > 0 and rng:NextNumber() < (A.ClassicChance or 0)) then
 		local colors = randomFrom(A.Classic, rng)
 		desc.HeadColor = colors.Head
 		desc.LeftArmColor = colors.Head
@@ -357,7 +364,7 @@ local function buildDescription(rng)
 		local hair = randomFrom(A.Hair, rng)
 		if hair then desc.HairAccessory = tostring(hair) end
 	end
-	return desc
+	return desc, nil
 end
 
 local function readAnimationIds(model)
@@ -378,14 +385,24 @@ local function readAnimationIds(model)
 	return ids
 end
 
-local function buildTemplate(rng)
+local function buildTemplate(rng, role)
 	for attempt = 1, 3 do
-		local desc = attempt < 3 and buildDescription(rng) or Instance.new("HumanoidDescription")
+		local desc, look = nil, nil
+		if attempt < 3 then
+			desc, look = buildDescription(rng, role)
+		else
+			desc = Instance.new("HumanoidDescription")
+		end
 		local ok, model = pcall(function()
 			return Players:CreateHumanoidModelFromDescription(desc, Enum.HumanoidRigType.R15)
 		end)
 		if ok and model then
-			return model, readAnimationIds(model)
+			--  [aspecto] Equipo encima (si falla, queda con la ropa base).
+			if look and Tac.dressModel then
+				local dressed, err = pcall(Tac.dressModel, model, look, rng)
+				if not dressed then warn("[Bots] No se pudo poner el equipo: " .. tostring(err)) end
+			end
+			return model, readAnimationIds(model), look and look.style.Name
 		end
 		warn("[Bots] No se pudo armar el avatar (intento " .. attempt .. "): " .. tostring(model))
 	end
@@ -3503,6 +3520,305 @@ function Tac.addFlashlight(gun, handle)
 end
 
 -- --------------------------------------------------------------------------
+--  ASPECTO (25/09): estilos de ropa y equipo hecho con piezas
+--
+--  Sin IDs del catalogo (salvo la ropa civil de Avatar.Shirts / Pants): el
+--  uniforme es el color del cuerpo con material de tela, y el equipo (casco,
+--  chaleco, mochila, botas, camuflaje...) son piezas soldadas al cuerpo
+--  dentro de la carpeta "BotEquipo". Sin colision ni raycasts: no frenan
+--  balas ni cambian la hitbox. Los estilos viven en BotConfig.Avatar.Styles.
+-- --------------------------------------------------------------------------
+Tac.HEAD_COVER = { Casco = true, Boonie = true, Gorro = true, Boina = true, Gorra = true }
+Tac.CLOTH_PARTS = { "UpperTorso", "LowerTorso", "LeftUpperArm", "RightUpperArm", "LeftLowerArm", "RightLowerArm",
+	"LeftUpperLeg", "RightUpperLeg", "LeftLowerLeg", "RightLowerLeg" }
+
+function Tac.pickStyle(A, rng)
+	if type(A.Styles) ~= "table" or #A.Styles == 0 then return nil end
+	return pickWeighted(A.Styles, rng)
+end
+
+--  Clave al azar de un mapa { Nombre = peso }.
+function Tac.weightedKey(map, rng)
+	if type(map) ~= "table" then return nil end
+	local keys, total = {}, 0
+	for key, weight in pairs(map) do
+		table.insert(keys, key)
+		total += weight
+	end
+	if total <= 0 then return nil end
+	table.sort(keys)
+	local roll = rng:NextNumber(0, total)
+	for _, key in ipairs(keys) do
+		roll -= map[key]
+		if roll <= 0 then return key end
+	end
+	return keys[#keys]
+end
+
+--  Un poco de variacion de brillo: dos uniformes iguales no salen identicos.
+function Tac.jitter(color, rng, amount)
+	if not color then return nil end
+	local k = 1 + rng:NextNumber(-(amount or 0.06), amount or 0.06)
+	return Color3.new(math.clamp(color.R * k, 0, 1), math.clamp(color.G * k, 0, 1), math.clamp(color.B * k, 0, 1))
+end
+
+--  Colores del cuerpo (el uniforme) en la HumanoidDescription y la lista de
+--  equipo que despues pone Tac.dressModel.
+function Tac.styleDescription(desc, A, style, rng, role)
+	local gear = style.Gear or {}
+	local function chance(key) return rng:NextNumber() < (gear[key] or 0) end
+	local skin = randomFrom(A.SkinTones, rng) or Color3.fromRGB(234, 184, 146)
+	local look = { style = style, kind = style.Kind, skin = skin }
+	local top, bottom
+	if style.Kind == "Civil" and A.Shirts and #A.Shirts > 0 and rng:NextNumber() < (style.CatalogChance or 0) then
+		--  Ropa del catalogo (la de siempre) + accesorios.
+		top, bottom = skin, skin
+		desc.Shirt = randomFrom(A.Shirts, rng) or 0
+		desc.Pants = randomFrom(A.Pants, rng) or 0
+		look.catalog = true
+	else
+		top = Tac.jitter(randomFrom(style.Top, rng) or skin, rng, 0.04)
+		bottom = Tac.jitter(randomFrom(style.Bottom, rng) or top, rng, 0.04)
+		look.shortSleeves = rng:NextNumber() < (style.ShortSleeveChance or 0)
+	end
+	look.top, look.bottom = top, bottom
+	local arms = look.shortSleeves and skin or top		-- manga corta: la manga es una pieza
+	desc.HeadColor = skin
+	desc.TorsoColor = top
+	desc.LeftArmColor = arms
+	desc.RightArmColor = arms
+	desc.LeftLegColor = bottom
+	desc.RightLegColor = bottom
+
+	look.gearColor = Tac.jitter(randomFrom(style.Vest, rng) or top, rng, 0.05)
+	look.headgear = Tac.weightedKey(style.Headgear, rng)
+	if role and role.Kind == "Lider" and style.Kind == "Militar" and rng:NextNumber() < 0.5 then
+		look.headgear = "Boina"		-- el Lider a veces con boina
+	end
+	if look.headgear == "Ninguno" then look.headgear = nil end
+	look.headgearColor = Tac.jitter(randomFrom(style.HeadgearColors, rng) or look.gearColor, rng, 0.05)
+	look.vest = chance("Chaleco")
+	look.backpack = chance("Mochila")
+	look.belt = chance("Cinturon")
+	look.kneePads = chance("Rodilleras")
+	look.scarf = chance("Bufanda") and (randomFrom(style.ScarfColors, rng) or look.gearColor) or nil
+	look.headset = chance("Auriculares")
+	look.glasses = chance("Gafas")
+	look.nvg = chance("VisionNocturna")
+	look.gloves = chance("Guantes") and (randomFrom(style.Gloves, rng) or Color3.fromRGB(35, 35, 35)) or nil
+	look.boots = randomFrom(style.Boots, rng)
+	look.camo = style.Camo
+	if chance("Pasamontanas") then
+		look.mask = randomFrom(style.MaskColors, rng) or look.gearColor
+		desc.HeadColor = look.mask
+	end
+	local face = randomFrom(A.Faces, rng)
+	if face then desc.Face = face end
+	if not Tac.HEAD_COVER[look.headgear or ""] and not look.mask and rng:NextNumber() < (style.HairChance or A.HairChance or 0) then
+		local hair = randomFrom(A.Hair, rng)
+		if hair then desc.HairAccessory = tostring(hair) end
+	end
+	return look
+end
+
+--  Pone el equipo sobre el modelo recien armado (la plantilla del bot: cada
+--  vida es una copia, asi que se arma una sola vez por bot).
+function Tac.dressModel(model, look, rng)
+	local style = look.style
+	local A = Config.Avatar
+	local folder = Instance.new("Folder")
+	folder.Name = "BotEquipo"
+	local count, maxParts = 0, A.MaxGearParts or 40
+	local fabric, leather, plastic = Enum.Material.Fabric, Enum.Material.Leather, Enum.Material.SmoothPlastic
+	local dark = Color3.fromRGB(28, 28, 30)
+	local function body(name) return model:FindFirstChild(name) end
+	local function add(attach, name, size, offset, color, material, shape)
+		if not attach or not color or count >= maxParts then return nil end
+		count += 1
+		local piece = Instance.new("Part")
+		piece.Name = name
+		piece.Size = size
+		piece.Color = color
+		piece.Material = material or fabric
+		piece.Anchored = false
+		piece.CanCollide = false
+		piece.CanQuery = false
+		piece.CanTouch = false
+		piece.Massless = true
+		piece.CastShadow = false
+		if shape == "Ball" then
+			local mesh = Instance.new("SpecialMesh")
+			mesh.MeshType = Enum.MeshType.Sphere
+			mesh.Parent = piece
+		elseif shape == "Cylinder" then
+			piece.Shape = Enum.PartType.Cylinder
+		end
+		piece.CFrame = attach.CFrame * offset
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = attach
+		weld.Part1 = piece
+		weld.Parent = piece
+		piece.Parent = folder
+		return piece
+	end
+
+	--  Uniforme / ropa lisa con textura de tela.
+	if not look.catalog then
+		for _, name in ipairs(Tac.CLOTH_PARTS) do
+			local part = body(name)
+			if part then part.Material = fabric end
+		end
+	end
+
+	--  Cabeza
+	local head = body("Head")
+	if head then
+		local s = head.Size
+		local hg, hc = look.headgear, look.headgearColor
+		if hg == "Casco" then
+			add(head, "Casco", Vector3.new(s.X * 1.26, s.Y * 0.84, s.Z * 1.3), CFrame.new(0, s.Y * 0.3, s.Z * 0.03), hc, fabric, "Ball")
+			--  Borde del casco (por encima de los ojos, no tapa la cara).
+			add(head, "CascoBorde", Vector3.new(0.12, s.X * 1.34, s.Z * 1.34), CFrame.new(0, s.Y * 0.27, s.Z * 0.04) * CFrame.Angles(0, 0, math.rad(90)),
+				Tac.jitter(hc, rng, 0.06), fabric, "Cylinder")
+			if look.nvg then
+				add(head, "SoporteVN", Vector3.new(0.35, 0.3, 0.2), CFrame.new(0, s.Y * 0.5, -s.Z * 0.62), dark, plastic)
+			end
+			if look.glasses then
+				add(head, "GafasCasco", Vector3.new(s.X * 0.85, s.Y * 0.17, 0.16), CFrame.new(0, s.Y * 0.42, -s.Z * 0.58), dark, plastic)
+				look.glasses = false
+			end
+		elseif hg == "Gorra" then
+			add(head, "Gorra", Vector3.new(s.X * 1.08, s.Y * 0.56, s.Z * 1.1), CFrame.new(0, s.Y * 0.32, 0), hc, fabric, "Ball")
+			local visor = rng:NextNumber() < 0.2 and 1 or -1		-- a veces para atras
+			add(head, "Visera", Vector3.new(s.X * 0.72, 0.07, s.Z * 0.5), CFrame.new(0, s.Y * 0.2, visor * s.Z * 0.66), hc, fabric)
+		elseif hg == "Gorro" then
+			add(head, "Gorro", Vector3.new(s.X * 1.1, s.Y * 0.8, s.Z * 1.12), CFrame.new(0, s.Y * 0.3, 0), hc, fabric, "Ball")
+			if rng:NextNumber() < 0.3 then
+				add(head, "Pompon", Vector3.new(0.4, 0.4, 0.4), CFrame.new(0, s.Y * 0.72, 0), Tac.jitter(hc, rng, 0.2), fabric, "Ball")
+			end
+		elseif hg == "Boonie" then
+			add(head, "Boonie", Vector3.new(s.X * 1.08, s.Y * 0.56, s.Z * 1.1), CFrame.new(0, s.Y * 0.33, 0), hc, fabric, "Ball")
+			add(head, "Ala", Vector3.new(0.06, s.X * 1.9, s.X * 1.9), CFrame.new(0, s.Y * 0.16, 0) * CFrame.Angles(0, 0, math.rad(90)), hc, fabric, "Cylinder")
+		elseif hg == "Boina" then
+			add(head, "Boina", Vector3.new(s.X * 1.15, s.Y * 0.34, s.Z * 1.15), CFrame.new(s.X * 0.08, s.Y * 0.47, 0) * CFrame.Angles(0, 0, math.rad(-10)), hc, fabric, "Ball")
+		end
+		if look.headset then
+			for _, side in ipairs({ -1, 1 }) do
+				add(head, "Auricular", Vector3.new(0.2, s.Y * 0.45, s.Y * 0.45), CFrame.new(side * (s.X * 0.5 + 0.1), s.Y * 0.02, 0), dark, plastic, "Cylinder")
+			end
+			if not hg then
+				add(head, "Diadema", Vector3.new(s.X * 1.12, 0.1, 0.2), CFrame.new(0, s.Y * 0.56, 0), dark, plastic)
+			end
+		end
+		if look.glasses then
+			add(head, "Gafas", Vector3.new(s.X * 0.82, s.Y * 0.16, 0.1), CFrame.new(0, s.Y * 0.08, -s.Z * 0.5 - 0.03), dark, plastic)
+		end
+	end
+
+	--  Torso: chaleco con bolsillos, mochila, bufanda, cinturon.
+	local torso = body("UpperTorso")
+	if torso then
+		local s = torso.Size
+		local gc = look.gearColor
+		if look.vest then
+			add(torso, "Chaleco", Vector3.new(s.X * 1.08, s.Y * 0.72, s.Z * 1.35), CFrame.new(0, -s.Y * 0.04, 0), gc, fabric)
+			for _, x in ipairs({ -0.3, 0, 0.3 }) do
+				add(torso, "Bolsillo", Vector3.new(s.X * 0.24, s.Y * 0.24, s.Z * 0.22), CFrame.new(x * s.X, -s.Y * 0.22, -s.Z * 0.78), Tac.jitter(gc, rng, 0.08), fabric)
+			end
+			if rng:NextNumber() < 0.5 then
+				add(torso, "Radio", Vector3.new(0.22, 0.4, 0.2), CFrame.new(-s.X * 0.32, s.Y * 0.18, -s.Z * 0.78), dark, plastic)
+			end
+		end
+		if look.backpack then
+			local bag = Tac.jitter(gc, rng, 0.1)
+			add(torso, "Mochila", Vector3.new(s.X * 0.72, s.Y * 0.85, s.Z * 0.6), CFrame.new(0, -s.Y * 0.02, s.Z * 0.95), bag, fabric)
+			if style.Kind == "Militar" and rng:NextNumber() < 0.5 then
+				add(torso, "Saco", Vector3.new(s.X * 0.7, s.Z * 0.42, s.Z * 0.42), CFrame.new(0, s.Y * 0.52, s.Z * 0.95), Tac.jitter(bag, rng, 0.15), fabric, "Cylinder")
+			end
+		end
+		if look.scarf then
+			add(torso, "Bufanda", Vector3.new(s.X * 0.56, s.Y * 0.2, s.Z * 1.12), CFrame.new(0, s.Y * 0.5, 0), look.scarf, fabric)
+		end
+	end
+	local lower = body("LowerTorso")
+	if lower and look.belt then
+		local s = lower.Size
+		add(lower, "Cinturon", Vector3.new(s.X * 1.06, s.Y * 0.9, s.Z * 1.12), CFrame.new(), Tac.jitter(look.gearColor, rng, 0.15), fabric)
+	end
+
+	--  Brazos y piernas: mangas, guantes / manos, rodilleras, botas.
+	for _, side in ipairs({ "Left", "Right" }) do
+		local upperArm, hand = body(side .. "UpperArm"), body(side .. "Hand")
+		local lowerLeg, foot = body(side .. "LowerLeg"), body(side .. "Foot")
+		if look.shortSleeves and upperArm then
+			local s = upperArm.Size
+			add(upperArm, "Manga", Vector3.new(s.X * 1.07, s.Y * 0.5, s.Z * 1.07), CFrame.new(0, s.Y * 0.26, 0), look.top, fabric)
+		end
+		if hand then
+			local s = hand.Size
+			if look.gloves then
+				add(hand, "Guante", s * 1.1, CFrame.new(), look.gloves, leather)
+			elseif not look.shortSleeves and not look.catalog then
+				add(hand, "Mano", s * 1.06, CFrame.new(), look.skin, Enum.Material.Plastic)
+			end
+		end
+		if lowerLeg then
+			local s = lowerLeg.Size
+			if look.kneePads then
+				add(lowerLeg, "Rodillera", Vector3.new(s.X * 0.74, s.Y * 0.3, s.Z * 0.32), CFrame.new(0, s.Y * 0.3, -s.Z * 0.5), Tac.jitter(look.gearColor, rng, 0.1), fabric)
+			end
+			if look.boots and style.Kind == "Militar" then
+				add(lowerLeg, "Cana", Vector3.new(s.X * 1.08, s.Y * 0.34, s.Z * 1.08), CFrame.new(0, -s.Y * 0.33, 0), look.boots, leather)
+			end
+		end
+		if foot and look.boots then
+			local s = foot.Size
+			add(foot, "Bota", Vector3.new(s.X * 1.1, s.Y * 1.35, s.Z * 1.16), CFrame.new(0, s.Y * 0.1, -s.Z * 0.03), look.boots,
+				style.Kind == "Militar" and leather or plastic)
+		end
+	end
+
+	--  Camuflaje: manchas de tela de otros colores sobre el uniforme.
+	local camo = look.camo
+	local patches = style.CamoPatches or A.CamoPatches or 6
+	if type(camo) == "table" and #camo > 0 and patches > 0 then
+		local spots = {
+			{ "UpperTorso", "back" }, { "UpperTorso", "back" }, { "UpperTorso", "front" },
+			{ "LeftUpperLeg", "front" }, { "RightUpperLeg", "front" }, { "LeftUpperLeg", "back" }, { "RightUpperLeg", "back" },
+			{ "LeftLowerLeg", "front" }, { "RightLowerLeg", "front" }, { "LeftUpperArm", "side" }, { "RightUpperArm", "side" },
+		}
+		for i = #spots, 2, -1 do
+			local j = rng:NextInteger(1, i)
+			spots[i], spots[j] = spots[j], spots[i]
+		end
+		for i = 1, math.min(patches, #spots) do
+			local name, face = spots[i][1], spots[i][2]
+			local part = body(name)
+			if part and not (name == "UpperTorso" and face == "front" and look.vest) then
+				local s = part.Size
+				local color = Tac.jitter(randomFrom(camo, rng), rng, 0.05)
+				local height = s.Y * rng:NextNumber(0.22, 0.42)
+				local dy = rng:NextNumber(-1, 1) * (s.Y - height) * 0.5
+				if face == "side" then
+					local depth = s.Z * rng:NextNumber(0.35, 0.6)
+					local sign = string.sub(name, 1, 4) == "Left" and -1 or 1
+					add(part, "Camuflaje", Vector3.new(0.04, height, depth),
+						CFrame.new(sign * (s.X * 0.5 + 0.02), dy, rng:NextNumber(-1, 1) * (s.Z - depth) * 0.5), color, fabric)
+				else
+					local width = s.X * rng:NextNumber(0.3, 0.55)
+					local sign = face == "front" and -1 or 1
+					add(part, "Camuflaje", Vector3.new(width, height, 0.04),
+						CFrame.new(rng:NextNumber(-1, 1) * (s.X - width) * 0.5, dy, sign * (s.Z * 0.5 + 0.02)), color, fabric)
+				end
+			end
+		end
+	end
+
+	folder.Parent = model
+	model:SetAttribute("BotEstilo", style.Name)
+end
+
+-- --------------------------------------------------------------------------
 --  Brazos: las mismas poses que ACS le pone a un jugador en tercera persona
 --  (Evt.GunStance): apuntando (RightAim/LeftAim) y corriendo (Sprint).
 -- --------------------------------------------------------------------------
@@ -5843,9 +6159,10 @@ local function addBot()
 	--  El avatar se arma en segundo plano (CreateHumanoidModelFromDescription
 	--  descarga la ropa). Para cuando le toque entrar a la ronda ya esta.
 	task.spawn(function()
-		local template, ids = buildTemplate(rng)
+		local template, ids, styleName = buildTemplate(rng, role)
 		meta.template = template
 		meta.animIds = ids
+		if styleName then dprint(name, "viste estilo", styleName) end
 	end)
 
 	local bot = Registry.create({
