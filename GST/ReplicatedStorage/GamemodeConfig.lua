@@ -45,7 +45,6 @@
 --                      se juega en Arcade (Control necesita AreaObjetivo).
 --    Control           [26/09] (solo Control) puntos por mantener el area,
 --                      ver abajo.
---    RNG               [27/09] (solo RNG) armas al azar con la G, ver abajo.
 --    KillPoints        [26/09] false = las eliminaciones (y demas) NO dan
 --                      puntos en este modo. El RoundManager ademas deja fijo
 --                      el valor de puntos de leaderstats en los del modo.
@@ -62,7 +61,7 @@ GamemodeConfig.STUDS_PER_METER = 3.5714
 GamemodeConfig.Default = "Arcade"
 
 --  Orden en el que salen en la votacion.
-GamemodeConfig.Order = { "Arcade", "DueloEquipos", "DueloVidas", "Eliminacion", "Ejecucion", "Guardian", "Control", "RNG" }
+GamemodeConfig.Order = { "Arcade", "DueloEquipos", "DueloVidas", "Eliminacion", "Ejecucion", "Guardian", "Control" }
 
 GamemodeConfig.Modes = {
 	Arcade = {
@@ -163,24 +162,6 @@ GamemodeConfig.Modes = {
 		Control = {
 			PointsPerSecond = 1,	-- por cada jugador de ventaja dentro del area
 			ScoreLimit = 0,			-- > 0: gana el primero que llega (0 = solo el tiempo)
-		},
-	},
-
-	--  [27/09/2026] RNG: del loadout solo se entregan melee y misc. Con la G
-	--  (LocalScript RNGClient en StarterPlayerScripts) sale un arma al azar
-	--  de TODAS las de ReplicatedStorage.GunStorage, del slot que sea. Se
-	--  pueden tener MaxWeapons a la vez: con las dos y otra tirada, se cambia
-	--  la primera que saliste. Al morir se pierden y se vuelve a tirar.
-	RNG = {
-		Label = "RNG",
-		Duration = 300,
-		Lives = 0,
-		EndWhenOneLeft = false,
-		JoinWindow = 0,
-		RNG = {
-			BlockedSlots = "2Primary,3Secondary,4Tertiary",	-- slots del loadout que NO se entregan
-			MaxWeapons = 2,
-			Cooldown = 1,			-- segundos entre tiradas
 		},
 	},
 

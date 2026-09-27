@@ -243,22 +243,6 @@ end
 --  servidor, asi DownedServer / CorpseServer / BotServer tambien lo ven).
 if not GAMEMODE_RULES.Control then GAMEMODE_RULES.Control = Control.DEFAULT_RULES end
 if not table.find(gamemodes, "Control") then table.insert(gamemodes, "Control") end
---  [27/09] RNG: igual, reglas de respaldo por si GamemodeConfig no lo trae.
-local RNG = { owned = {}, lastRoll = {}, pool = nil }
-RNG.DEFAULT_RULES = {
-	Label = "RNG",
-	Duration = 300,
-	Lives = 0,
-	EndWhenOneLeft = false,
-	JoinWindow = 0,
-	RNG = {
-		BlockedSlots = "2Primary,3Secondary,4Tertiary",	-- del loadout solo quedan melee y misc
-		MaxWeapons = 2,			-- con 2 y otra tirada, se cambia la PRIMERA que saco
-		Cooldown = 1,			-- segundos entre tiradas
-	},
-}
-if not GAMEMODE_RULES.RNG then GAMEMODE_RULES.RNG = RNG.DEFAULT_RULES end
-if not table.find(gamemodes, "RNG") then table.insert(gamemodes, "RNG") end
 
 local function rulesFor(name)
 	return GAMEMODE_RULES[name] or GAMEMODE_RULES[DEFAULT_GAMEMODE]
@@ -707,13 +691,6 @@ local function preparePlayerForRound(player)
 				Guardian.setLeader(roundTeam, player)
 			end
 		end
-	end
-	--  [27/09 RNG] Del loadout solo se entregan melee y misc; las armas salen
-	--  con la G (ver la seccion RNG).
-	local rngRules = rulesFor(currentGamemode).RNG
-	if rngRules then
-		player:SetAttribute("RestrictedSlots", rngRules.BlockedSlots or RNG.DEFAULT_RULES.RNG.BlockedSlots)
-		Guardian.stripRestricted(player)
 	end
 	player:SetAttribute("CanUseRoundTools", false)
 	clearPlayerTools(player)
@@ -1870,137 +1847,6 @@ function Control.stop(clearScores)
 	end
 end
 
---==========================================================================
---  [27/09/2026] RNG
---
---  Del loadout solo quedan melee y misc (RestrictedSlots, lo respeta
---  LoadoutServer). Con la G (LocalScript RNGClient) el jugador pide un arma
---  al azar de TODAS las de ReplicatedStorage.GunStorage, sea del slot que
---  sea. Maximo MaxWeapons (2): con las dos y otra tirada se cambia la
---  primera que saco. Al morir se pierden (la mochila se vacia) y se vuelve
---  a tirar. Se publica en el jugador RNGWeapons ("AK-47|Glock 26") y
---  RNGNextAt (cuando puede volver a tirar) para el texto de la derecha.
---==========================================================================
-RNG.GUN_SLOTS = { ["2Primary"] = true, ["3Secondary"] = true, ["4Tertiary"] = true }
-
-RNG.remote = system:FindFirstChild("RNGRoll")
-if not RNG.remote then
-	RNG.remote = Instance.new("RemoteEvent")
-	RNG.remote.Name = "RNGRoll"
-	RNG.remote.Parent = system
-end
-
---  Las armas que pueden salir: las Tools de GunStorage con ACS_Settings
---  (armas de fuego). Si traen WeaponCategory, solo primaria/secundaria/
---  terciaria (no melee ni misc). Se lee una vez por ronda.
-function RNG.buildPool()
-	local pool = {}
-	local storage = ReplicatedStorage:FindFirstChild("GunStorage")
-	if not storage then
-		warn("[RoundManager] RNG: no encontre ReplicatedStorage.GunStorage")
-		return pool
-	end
-	for _, item in ipairs(storage:GetDescendants()) do
-		if item:IsA("Tool") and item:FindFirstChild("ACS_Settings") then
-			local category = item:GetAttribute("WeaponCategory")
-			if category == nil or RNG.GUN_SLOTS[category] then
-				table.insert(pool, item)
-			end
-		end
-	end
-	if #pool == 0 then warn("[RoundManager] RNG: GunStorage no tiene armas con ACS_Settings") end
-	return pool
-end
-
---  Las que todavia tiene (las que se destruyeron al morir ya no cuentan).
-function RNG.current(player)
-	local list = RNG.owned[player] or {}
-	local alive = {}
-	for _, tool in ipairs(list) do
-		if tool.Parent and (tool.Parent == player.Character or tool.Parent == player:FindFirstChildOfClass("Backpack")) then
-			table.insert(alive, tool)
-		elseif tool.Parent then
-			tool:Destroy()
-		end
-	end
-	RNG.owned[player] = alive
-	return alive
-end
-
-function RNG.publish(player)
-	local names = {}
-	for _, tool in ipairs(RNG.current(player)) do table.insert(names, tool.Name) end
-	player:SetAttribute("RNGWeapons", table.concat(names, "|"))
-end
-
-function RNG.roll(player)
-	local rules = rulesFor(currentGamemode).RNG
-	if not rules or phase ~= "Round" or player:GetAttribute("InRound") ~= true then return end
-	local now = os.clock()
-	local cooldown = tonumber(rules.Cooldown) or 1
-	if now - (RNG.lastRoll[player] or -100) < cooldown then return end
-	local character = player.Character
-	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-	local backpack = player:FindFirstChildOfClass("Backpack")
-	if not humanoid or humanoid.Health <= 0 or not backpack then return end
-	if (character:GetAttribute("DownedState") or "") ~= "" then return end
-	RNG.pool = RNG.pool or RNG.buildPool()
-	if #RNG.pool == 0 then return end
-	RNG.lastRoll[player] = now
-
-	--  Al azar, sin repetir una que ya tiene (si hay de donde elegir).
-	local list = RNG.current(player)
-	local have = {}
-	for _, tool in ipairs(list) do have[tool.Name] = true end
-	local choices = {}
-	for _, tool in ipairs(RNG.pool) do
-		if not have[tool.Name] then table.insert(choices, tool) end
-	end
-	if #choices == 0 then choices = RNG.pool end
-	local source = choices[math.random(1, #choices)]
-
-	--  Lleno: sale la primera que saco.
-	local held = false
-	local maxWeapons = math.max(1, tonumber(rules.MaxWeapons) or 2)
-	while #list >= maxWeapons do
-		local oldest = table.remove(list, 1)
-		held = held or oldest.Parent == character
-		oldest:Destroy()
-	end
-	local tool = source:Clone()
-	tool:SetAttribute("RNGWeapon", true)
-	tool.Parent = backpack
-	table.insert(list, tool)
-	RNG.owned[player] = list
-	--  Si tenia en la mano la que se cambio, queda con la nueva en la mano.
-	if held then
-		task.defer(function()
-			if tool.Parent == backpack and humanoid.Parent and humanoid.Health > 0 then humanoid:EquipTool(tool) end
-		end)
-	end
-	player:SetAttribute("RNGNextAt", Workspace:GetServerTimeNow() + cooldown)
-	RNG.publish(player)
-	dprint("[RoundManager] RNG:", player.Name, "saco", tool.Name)
-end
-
-function RNG.reset()
-	for player in pairs(RNG.owned) do
-		if typeof(player) == "Instance" and player.Parent then
-			player:SetAttribute("RNGWeapons", nil)
-			player:SetAttribute("RNGNextAt", nil)
-		end
-	end
-	RNG.owned, RNG.lastRoll, RNG.pool = {}, {}, nil
-end
-
-RNG.remote.OnServerEvent:Connect(function(player)
-	local ok, err = pcall(RNG.roll, player)
-	if not ok then warn("[RoundManager] RNG: " .. tostring(err)) end
-end)
-Players.PlayerRemoving:Connect(function(player)
-	RNG.owned[player], RNG.lastRoll[player] = nil, nil
-end)
-
 local function onRoundDeath(player)
 	if phase ~= "Round" then return end
 	if player:GetAttribute("InRound") ~= true then return end
@@ -2257,7 +2103,6 @@ local function startRound(mapName, modeName, firstPlayer)
 	--  [22/09 Guardian] Estado limpio, espera de reaparicion del modo, y
 	--  la eleccion de lideres a los PickDelay segundos.
 	Guardian.reset()
-	pcall(RNG.reset)				-- [27/09] armas de RNG de la ronda anterior
 	--  [26/09] Control: marcador y area del mapa.
 	--  (con pcall: si algo del marcador fallara, la ronda arranca igual)
 	local controlOk, controlErr = pcall(function()
@@ -2497,7 +2342,6 @@ local function runRoundCycle()
 	resetTeamLives(false)			-- [22/09] se limpian las del duelo anterior
 	Guardian.reset()				-- [22/09] y el Guardian
 	pcall(Control.stop, true)		-- [26/09] y el marcador de Control
-	pcall(RNG.reset)				-- [27/09] y las armas de RNG
 	state:SetAttribute("ModeRespawnDelay", nil)
 	for _, player in ipairs(participants()) do
 		player:SetAttribute("RespawnReadyAt", nil)
