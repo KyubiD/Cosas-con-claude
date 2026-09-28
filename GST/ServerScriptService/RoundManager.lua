@@ -140,7 +140,9 @@ local ambiences = {}
 local DEFAULT_AMBIENCE = nil
 --  [22/09/2026] Especiales (Ventisca): no van en la lista normal. En cada
 --  votacion tiran su BallotChance y, si sale, uno de ellos reemplaza a
---  una de las 3 opciones sorteadas. Nunca mas de un especial por boleta.
+--  una de las 3 opciones sorteadas. [28/09] Y despues se vuelve a tirar
+--  por la siguiente: con mala suerte salen 2 o las 3 especiales (ver
+--  rollAmbienceBallot).
 local specialAmbiences = {}			-- { { chance = 0.25, keys = {...} } }
 --  [22/09] Que mapas admite cada especial: [clave] = { maps, fallback }
 --  (va colgado de la misma tabla para no sumar locals al chunk).
@@ -580,18 +582,35 @@ end
 local function rollAmbienceBallot()
 	ambienceBallot = pickBallot(ambiences, AMBIENCE_BALLOT_SIZE)
 
-	--  Especiales: el primero que gane su tirada entra y listo.
-	if #ambienceBallot > 0 then
+	--  Especiales: se tiran los dados (el primero que gane su BallotChance
+	--  entra en una opcion normal al azar). [28/09] Si entro uno, se vuelve
+	--  a tirar por otra opcion, y asi hasta que ninguno gane o ya no queden
+	--  normales: la chance de 1 especial es la de siempre, la de 2 es esa
+	--  al cuadrado y la de 3, al cubo. Nunca el mismo especial dos veces.
+	while #ambienceBallot > 0 do
+		local normalSlots = {}
+		for index, key in ipairs(ambienceBallot) do
+			if not specialAmbiences.byKey[key] then table.insert(normalSlots, index) end
+		end
+		if #normalSlots == 0 then break end
+		local picked = nil
 		for _, special in ipairs(specialAmbiences) do
 			if math.random() < special.chance then
-				local key = special.keys[math.random(1, #special.keys)]
-				ambienceBallot[math.random(1, #ambienceBallot)] = key
-				table.sort(ambienceBallot)
-				dprint("[RoundManager] Salio ambiente especial en la boleta:", key)
-				break
+				local fresh = {}
+				for _, key in ipairs(special.keys) do
+					if not table.find(ambienceBallot, key) then table.insert(fresh, key) end
+				end
+				if #fresh > 0 then
+					picked = fresh[math.random(1, #fresh)]
+					break
+				end
 			end
 		end
+		if not picked then break end
+		ambienceBallot[normalSlots[math.random(1, #normalSlots)]] = picked
+		dprint("[RoundManager] Salio ambiente especial en la boleta:", picked)
 	end
+	table.sort(ambienceBallot)
 	return ambienceBallot
 end
 
