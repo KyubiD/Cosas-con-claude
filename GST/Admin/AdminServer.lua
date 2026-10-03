@@ -346,17 +346,17 @@ local function handleMatch(player, session, payload)
 	reply(session, player, ok, message, "match", info)
 end
 
---  [03/10] Equipos: lo hace el script AdminTeamControl.
-local TEAM_ACTIONS = { options = true, set = true }
+--  [03/10] Equipos: los cambia el RoundManager (AdminMatchControl).
+local TEAM_ACTIONS = { options = "teams", set = "setTeam" }
 local TEAM_NAMES = { Rojo = true, Azul = true, Verde = true, Amarillo = true, Auto = true }
 
 local function handleTeam(player, session, payload)
 	if type(payload) ~= "table" or not TEAM_ACTIONS[payload.action] then
 		return
 	end
-	local control = ServerStorage:FindFirstChild("AdminTeamControl")
+	local control = ServerStorage:FindFirstChild("AdminMatchControl")
 	if not control then
-		reply(session, player, false, "AdminTeamControl no está corriendo", "team")
+		reply(session, player, false, "RoundManager no está disponible", "team")
 		return
 	end
 	local data = nil
@@ -369,10 +369,10 @@ local function handleTeam(player, session, payload)
 		data = { target = target, team = payload.team }
 	end
 	local invokeOk, ok, message, info = pcall(function()
-		return control:Invoke(payload.action, data)
+		return control:Invoke(TEAM_ACTIONS[payload.action], data)
 	end)
 	if not invokeOk then
-		reply(session, player, false, "Error en AdminTeamControl: " .. tostring(ok), "team")
+		reply(session, player, false, "Error en RoundManager: " .. tostring(ok), "team")
 		return
 	end
 	reply(session, player, ok, message, "team", info)

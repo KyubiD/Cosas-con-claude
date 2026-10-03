@@ -727,8 +727,8 @@ clearBotsButton.Activated:Connect(function()
 	setFeedback(botFeedback, "Quitando todos los bots...", true)
 end)
 
---  [03/10] EQUIPOS: fijar el equipo de un jugador o de los bots (lo hace
---  el script AdminTeamControl). Fijado = se cambia ya si esta jugando, y si
+--  [03/10] EQUIPOS: fijar el equipo de un jugador o de los bots (los cambia
+--  el RoundManager). Fijado = se cambia ya si esta jugando, y si
 --  no, entra a ese equipo la proxima vez. AUTO lo vuelve a dejar al azar.
 local TeamPanel = {
 	order = { "Rojo", "Azul", "Verde", "Amarillo", "Auto" },

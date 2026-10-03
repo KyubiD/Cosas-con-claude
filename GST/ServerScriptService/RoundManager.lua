@@ -597,6 +597,12 @@ end
 
 local function getBalancedRoundTeam(modeName, excludedPlayer)
 	local availableTeams = getRoundTeamNames(modeName)
+	--  [03/10 ADMIN] Equipo fijado desde el panel (atributo ForcedTeam): si
+	--  existe en esta partida, va ahi sin importar el balance.
+	local forced = excludedPlayer and excludedPlayer:GetAttribute("ForcedTeam")
+	if type(forced) == "string" and table.find(availableTeams, forced) then
+		return forced
+	end
 	local counts = {}
 	for _, teamName in ipairs(availableTeams) do counts[teamName] = 0 end
 	for _, player in ipairs(participants()) do
@@ -646,6 +652,12 @@ end
 --  Equipo mas chico de los que todavia tienen reapariciones (nil si no
 --  queda ninguno: no tiene sentido meter a alguien a un equipo muerto).
 local function pickTeamWithLives(excludedPlayer)
+	--  [03/10 ADMIN] Equipo fijado, si todavia le quedan reapariciones.
+	local forced = excludedPlayer and excludedPlayer:GetAttribute("ForcedTeam")
+	if type(forced) == "string" and (TeamLifePool.lives[forced] or 0) > 0
+		and table.find(getRoundTeamNames(currentMode), forced) then
+		return forced
+	end
 	local counts = {}
 	for teamName, pool in pairs(TeamLifePool.lives) do
 		if pool > 0 then counts[teamName] = 0 end
@@ -2910,9 +2922,114 @@ do
 		return true
 	end
 
+	--==================================================================
+	--  [03/10/2026] EQUIPOS desde el panel (F4 > EQUIPOS)
+	--    :Invoke("teams")                              -> true, "", info
+	--    :Invoke("setTeam", { target = ..., team = ...}) -> ok, mensaje, info
+	--        target: nombre exacto, "*bots", "*players" o "*all"
+	--        team:   "Rojo", "Azul", "Verde", "Amarillo" o "Auto"
+	--  Fijar = atributo ForcedTeam: getBalancedRoundTeam / pickTeamWithLives
+	--  lo respetan al entrar, y si ya esta jugando se cambia aqui mismo con
+	--  setPlayerTeam (Team + RoundTeam juntos). Auto lo quita. Si el equipo
+	--  no existe en esta partida (Verde con 2 equipos, FFA, Supervivencia)
+	--  queda fijado para la siguiente. Al lider del Guardian no se le mueve.
+	--==================================================================
+	local TEAM_CHOICES = { Rojo = true, Azul = true, Verde = true, Amarillo = true }
+
+	local function inMatch()
+		return phase == "Round" or phase == "Ready"
+	end
+
+	local function matchTeams()
+		if not inMatch() then return {} end
+		local list = getRoundTeamNames(currentMode)
+		if #list == 1 and list[1] == "Neutral" then return {} end
+		return list
+	end
+
+	local function teamSnapshot()
+		local people = {}
+		for _, participant in ipairs(participants()) do
+			table.insert(people, {
+				name = participant.Name,
+				bot = isBot(participant),
+				team = participant:GetAttribute("RoundTeam") or "",
+				forced = participant:GetAttribute("ForcedTeam") or "",
+			})
+		end
+		table.sort(people, function(a, b)
+			if a.bot ~= b.bot then return not a.bot end
+			return a.name:lower() < b.name:lower()
+		end)
+		return { phase = phase, mode = inMatch() and (currentMode or "") or "", teams = matchTeams(), people = people }
+	end
+
+	local function moveTeam(participant, teamName)
+		local current = participant:GetAttribute("RoundTeam")
+		if current == teamName then return true end
+		if current and Guardian.leaders[current] == participant and Guardian.alive[current] == true then
+			return false, participant.Name .. " es lider del Guardian: no se cambia"
+		end
+		if not setPlayerTeam(participant, teamName) then
+			return false, "No existe el equipo " .. teamName
+		end
+		if roundPlayers[participant] == true then
+			TeamLifePool.lastTeam[participant.UserId] = teamName		-- si sale y vuelve, a este
+		end
+		return true
+	end
+
+	local function setTeams(data)
+		if type(data) ~= "table" then return false, "Datos invalidos" end
+		local target, teamName = data.target, data.team
+		if type(target) ~= "string" or target == "" then return false, "Elige a quien" end
+		if teamName ~= "Auto" and not TEAM_CHOICES[teamName] then return false, "Equipo invalido" end
+		local list = {}
+		for _, participant in ipairs(participants()) do
+			local bot = isBot(participant)
+			if target == "*all" or (target == "*bots" and bot) or (target == "*players" and not bot)
+				or participant.Name:lower() == target:lower() then
+				table.insert(list, participant)
+			end
+		end
+		if #list == 0 then
+			return false, (target == "*bots" and "No hay bots en el servidor") or (target:sub(1, 1) == "*" and "No hay nadie") or ("No se encontro a " .. target)
+		end
+		local who = (#list == 1) and list[1].Name or (#list .. " participantes")
+		if teamName == "Auto" then
+			for _, participant in ipairs(list) do participant:SetAttribute("ForcedTeam", nil) end
+			return true, who .. ": equipo automatico (lo reparte la partida)"
+		end
+
+		local available = table.find(matchTeams(), teamName) ~= nil
+		local moved, failed, lastError = 0, 0, nil
+		for _, participant in ipairs(list) do
+			participant:SetAttribute("ForcedTeam", teamName)
+			if available and participant:GetAttribute("InRound") == true
+				and participant:GetAttribute("RoundTeam") ~= teamName then
+				local ok, why = moveTeam(participant, teamName)
+				if ok then moved += 1 else failed += 1; lastError = why end
+			end
+		end
+		local message = ("%s: fijado en %s"):format(who, teamName)
+		if moved > 0 then message ..= (" · %d cambiado(s) ya"):format(moved) end
+		if not inMatch() then
+			message ..= " · entra a ese equipo en la proxima partida"
+		elseif not available then
+			message ..= " · en esta partida no existe ese equipo: se aplica en la siguiente que lo tenga"
+		end
+		if failed > 0 then message ..= (" · %d no: %s"):format(failed, tostring(lastError)) end
+		return failed == 0 or moved > 0, message
+	end
+
 	channel.OnInvoke = function(action, data)
 		if action == "options" then
 			return true, "", snapshot()
+		elseif action == "teams" then
+			return true, "", teamSnapshot()
+		elseif action == "setTeam" then
+			local ok, message = setTeams(data)
+			return ok, message, teamSnapshot()
 		elseif action == "clear" then
 			AdminForce.pending = nil
 			return true, "Sin forzar: decide la votación", snapshot()
