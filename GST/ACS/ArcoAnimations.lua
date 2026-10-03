@@ -2,9 +2,10 @@
 --  ACS_Animations del ARCO  (ModuleScript "ACS_Animations" dentro del Tool)
 --  [03/10/2026]  Estilo Rust.
 --
---  El arco va SIEMPRE en la mano izquierda (en el Handle) y la mano derecha
---  SIEMPRE en la cuerda, con la flecha (Mag). Todo se calcula cada frame
---  con la forma real del modelo, asi que no hay poses de brazos a mano:
+--  El arco va SIEMPRE en la mano izquierda (en el Handle). La flecha (Mag)
+--  va en la mano derecha, como en Rust: al empezar a cargar la mano la
+--  lleva a la cuerda, la monta y recien ahi empieza a tensar. Todo se
+--  calcula cada frame con la forma real del modelo:
 --    · En reposo / corriendo / patrulla el arco va abajo a la izquierda e
 --      inclinado.
 --    · Al cargar (modo de disparo 6) el arco sube al centro con la flecha
@@ -90,6 +91,14 @@ self.Bow = {
 	RightHandOffset = Vector3.new(0.04, -0.10, 0.05),
 	LeftHandOffset = Vector3.new(0, 0, 0),
 	ArmSpeed = 26,
+
+	--  La flecha en la mano (como en Rust). En reposo la mano derecha va
+	--  aqui, medido desde el punto de la cuerda en reposo (X = a la derecha
+	--  del arco, Y = arriba, Z = hacia ti).
+	HandRestOffset = Vector3.new(0.15, -0.55, 0.35),
+	CarryTiltDeg = -12,			-- la flecha en la mano, apuntando un poco hacia abajo
+	CarryOffset = Vector3.new(0, 0, 0),
+	NockTime = 0.2,				-- segundos que tarda en montar la flecha en la cuerda
 
 	--  Resorte de la cuerda. Draw: siguiendo el porcentaje (sube o baja
 	--  suave). Release: al disparar (rapido; Damping mas bajo = vibra mas).
@@ -247,6 +256,7 @@ local function buildRig(objs)
 		pieces = {}, arrows = {},
 		x = 0, v = 0, target = 0, mode = "draw",
 		phase = "idle", t = 0, aim = 0, stance = "Idle",
+		n = 0, ratio = 0,		-- n: 0 = flecha en la mano, 1 = montada en la cuerda
 	}
 	rig.frameInv = rig.frame:Inverse()
 
@@ -412,6 +422,15 @@ end
 
 local function step(rig, dt)
 	local B = self.Bow
+	--  Montar / desmontar la flecha. Solo con la flecha montada se tensa.
+	local nockSpeed = dt / math.max(B.NockTime, 0.01)
+	if rig.phase == "draw" and not rig.arrowHidden then
+		rig.n = math.min(1, rig.n + nockSpeed)
+	elseif rig.phase ~= "draw" and rig.x < 0.05 then
+		rig.n = math.max(0, rig.n - nockSpeed)
+	end
+	rig.target = (rig.phase == "draw" and rig.n >= 1) and rig.ratio or 0
+
 	--  Resorte de la cuerda (con sub-pasos: el de soltar es muy duro).
 	local stiffness, damping
 	if rig.mode == "release" then
@@ -449,11 +468,14 @@ local function step(rig, dt)
 	local a = rig.aim * rig.aim * (3 - 2 * rig.aim)
 	local bow = rig.stanceCF:Lerp(aimFrame(), a) * rig.frameInv		-- el Handle en el espacio de los brazos
 
-	--  Manos: izquierda en el Handle, derecha en la cuerda.
+	--  Manos: izquierda en el Handle; derecha en la cuerda mientras carga (o
+	--  mientras la cuerda todavia esta tensa), si no, abajo con la flecha.
 	local cam = camPoint()
 	local function frameVec(v) return rig.frame:VectorToWorldSpace(v) end
 	local leftHand = bow * (rig.grip + frameVec(B.LeftHandOffset))
-	local rightHand = bow * (nock + frameVec(B.RightHandOffset))
+	local onString = rig.phase == "draw" or (rig.phase == "cancel" and rig.x > 0.05)
+	local rightHand = onString and bow * (nock + frameVec(B.RightHandOffset))
+		or bow * (rig.nock + frameVec(B.HandRestOffset))
 	if rig.phase == "release" and rig.t < 0.2 then
 		rightHand += bow:VectorToWorldSpace(rig.D * B.ReleaseFollowThrough + frameVec(Vector3.new(0.12, 0, 0)))
 	elseif rig.phase == "reload" then
@@ -469,6 +491,20 @@ local function step(rig, dt)
 	local alpha = 1 - math.exp(-speed * dt)
 	rig.r = rig.r:Lerp(armPose(rightHand, cam + B.ShoulderR), alpha)
 	rig.l = rig.l:Lerp(armPose(leftHand, cam + B.ShoulderL), alpha)
+
+	--  La flecha: entre la mano derecha (n = 0) y la cuerda (n = 1).
+	if #rig.arrows > 0 then
+		local handInBow = bow:Inverse() * (rig.r * B.HandLocal)
+		local tilt = CFrame.fromAxisAngle(rig.frame.RightVector, math.rad(B.CarryTiltDeg))
+		local carry = CFrame.new(handInBow + frameVec(B.CarryOffset)) * tilt * CFrame.new(-rig.nock)
+		local onBow = CFrame.new(nock - rig.nock)
+		local n = rig.n * rig.n * (3 - 2 * rig.n)
+		for _, piece in ipairs(rig.pieces) do
+			if piece.kind == "arrow" then
+				piece.weld.C0 = (carry * piece.rest):Lerp(onBow * piece.rest, n)
+			end
+		end
+	end
 
 	local rArm, lArm, gunWeld = rig.objs[1], rig.objs[2], rig.objs[3]
 	setWeldPose(rArm, rig.r)
@@ -519,7 +555,7 @@ self.ChargeProgress = function(objs, ratio, dt)
 		rig.phase, rig.t, rig.mode = "draw", 0, "draw"
 		if rig.arrowHidden then setArrowVisible(rig, true) end	-- si cargas, hay flecha
 	end
-	rig.target = math.clamp(ratio, 0, 1)		-- sube o baja: el resorte lo sigue suave
+	rig.ratio = math.clamp(ratio, 0, 1)		-- sube o baja: el resorte lo sigue suave
 end
 
 --  Disparo: lo llama el gancho ChargeShot del framework (siempre) y el
@@ -531,6 +567,7 @@ self.ChargeShot = function(objs)
 	if rig.phase == "release" and rig.t < 0.1 then return end
 	rig.phase, rig.t, rig.mode, rig.target = "release", 0, "release", 0
 	setArrowVisible(rig, false)		-- la flecha salio volando
+	rig.n = 0						-- la proxima aparece en la mano
 end
 self.ChargeFireAnim = self.ChargeShot
 
@@ -593,6 +630,7 @@ self.ReloadAnim = function(objs)
 	local before = rig.stance
 	rig.stance = "Reload"
 	rig.phase, rig.t, rig.mode, rig.target = "reload", 0, "cancel", 0
+	rig.n = 0						-- la flecha nueva sale en la mano
 	task.wait(B.ReloadReach + B.ReloadBack)
 	if rig.arrowHidden then setArrowVisible(rig, true) end
 	if rig.phase == "reload" then rig.phase = "idle" end
