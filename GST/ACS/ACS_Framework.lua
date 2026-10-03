@@ -5242,6 +5242,11 @@ function GunFx(ChargeSnd)
 	else
 		LL_PlayShot(muzzle.Fire, ModTable)
 	end
+	-- [BALLESTA 03/10] Aviso de disparo a la animacion del arma (la ballesta
+	-- esconde el virote y suelta la cuerda). Las armas sin ShotFired, igual.
+	if AnimData and AnimData.ShotFired then
+		pcall(AnimData.ShotFired, { RArmWeld, LArmWeld, GunWeld, WeaponInHand, ViewModel })
+	end
 	-- [30/09] GunFx seguro: si al modelo le falta un efecto se salta en vez
 	-- de tronar. Antes un Chamber.Shell faltante (Steyr Scout) mataba el hilo
 	-- de disparo y dejaba shooting/boltCooldown en true hasta re-equipar.
