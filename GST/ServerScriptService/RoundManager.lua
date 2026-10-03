@@ -93,6 +93,188 @@ local lobbySpawns = lobby:WaitForChild("Spawns")
 local lobbySpawn = lobbySpawns:WaitForChild("LobbySpawn")
 local lobbyPlatform = lobby:FindFirstChild("LobbyPlatform", true)
 
+--==========================================================================
+--  [29/09/2026] MAPAS EN SERVERSTORAGE
+--
+--  Antes los mapas vivian todos en Workspace.Mapas al mismo tiempo: cada
+--  cliente cargaba ~143 mil instancias (63 mil partes, 865 luces, 2 mil
+--  emisores de particulas) aunque se jugara uno solo, y el servidor los
+--  simulaba todos.
+--
+--  Ahora la GEOMETRIA vive en ServerStorage.MapasGuardados y solo la del
+--  mapa ganador pasa a Workspace.Mapas cuando termina la votacion (la
+--  anterior se guarda en ese mismo momento). Los modelos chicos de
+--  ServerStorage con los Spawn_* (Führer house, Metro, Plaza...) siguen
+--  siendo el "mapa" para las reglas; esto es solo lo que se ve y se pisa.
+--
+--  PARA EDITAR UN MAPA EN STUDIO: arrastralo de ServerStorage.MapasGuardados
+--  a Workspace.Mapas, editalo y devolvelo. Si te olvidas, no pasa nada: al
+--  arrancar el servidor se guarda solo.
+--
+--  El cliente avisa por RoundSystem.MapReady cuando ya recibio el mapa
+--  (MapasClient) y JUGAR espera ese aviso (con tope ReadyTimeout), para que
+--  nadie aparezca sobre un piso que todavia no le llego.
+--
+--  Puertas: los scripts de un mapa se reinician cada vez que entra al
+--  Workspace. Para que una puerta que quedo abierta no arranque "al reves",
+--  la primera vez se anota como esta cada puerta (modelo con
+--  ProximityPrompt o ClickDetector) y en las siguientes se deja igual antes
+--  de volver a cargar el mapa.
+--==========================================================================
+local MapLoader = {
+	--  [nombre INTERNO (el de los Spawn_*)] = carpeta de geometria
+	Geometry = {
+		["Führer house"] = "Führer house",
+		Metro            = "Metro",
+		Brutalist        = "Brutalist",
+		Plaza            = "Mall",
+		TestMap          = "Mapa de pruebas",
+		Prision          = "Prision",
+		Alpha_Backrooms  = "Alpha_Backrooms",
+	},
+	ReadyTimeout = 15,		-- segundos maximos esperando al cliente en JUGAR
+
+	active   = Workspace:FindFirstChild("Mapas"),
+	storage  = ServerStorage:FindFirstChild("MapasGuardados"),
+	remote   = system:FindFirstChild("MapReady"),
+	loaded   = nil,			-- carpeta de geometria cargada ahora
+	ready    = {},			-- [Player] = geometria que ese cliente ya recibio
+	joining  = {},			-- [Player] = true mientras espera en JUGAR
+	doorPoses = {},			-- [carpeta] = lista de { instancia, propiedades }
+}
+
+if not MapLoader.active then
+	MapLoader.active = Instance.new("Folder")
+	MapLoader.active.Name = "Mapas"
+	MapLoader.active.Parent = Workspace
+end
+if not MapLoader.storage then
+	MapLoader.storage = Instance.new("Folder")
+	MapLoader.storage.Name = "MapasGuardados"
+	MapLoader.storage.Parent = ServerStorage
+end
+if not MapLoader.remote then
+	MapLoader.remote = Instance.new("RemoteEvent")
+	MapLoader.remote.Name = "MapReady"
+	MapLoader.remote.Parent = system
+end
+state:SetAttribute("LoadedMap", "")
+
+--  Lo que haya quedado en Workspace.Mapas (por ejemplo despues de editarlo)
+--  se guarda al arrancar.
+for _, child in ipairs(MapLoader.active:GetChildren()) do
+	child.Parent = MapLoader.storage
+end
+
+function MapLoader.snapshotDoors(geo)
+	local list, seen = {}, {}
+	for _, d in ipairs(geo:GetDescendants()) do
+		if d:IsA("ProximityPrompt") or d:IsA("ClickDetector") then
+			local model = d:FindFirstAncestorOfClass("Model")
+			if model and model ~= geo and not seen[model] then
+				seen[model] = true
+				for _, item in ipairs(model:GetDescendants()) do
+					if item:IsA("BasePart") then
+						table.insert(list, { item, { CFrame = item.CFrame, Transparency = item.Transparency, CanCollide = item.CanCollide } })
+					elseif item:IsA("ProximityPrompt") then
+						table.insert(list, { item, { ActionText = item.ActionText, Enabled = item.Enabled } })
+					elseif item:IsA("BoolValue") or item:IsA("NumberValue") or item:IsA("IntValue") or item:IsA("StringValue") then
+						table.insert(list, { item, { Value = item.Value } })
+					end
+				end
+			end
+		end
+	end
+	return list
+end
+
+function MapLoader.restoreDoors(list)
+	for _, entry in ipairs(list) do
+		local item = entry[1]
+		if item.Parent then
+			for prop, value in pairs(entry[2]) do
+				pcall(function() item[prop] = value end)
+			end
+		end
+	end
+end
+
+--  Pasa la geometria de mapName a Workspace y guarda las demas.
+function MapLoader.load(mapName)
+	local geoName = MapLoader.Geometry[mapName] or mapName
+	local geo = MapLoader.active:FindFirstChild(geoName) or MapLoader.storage:FindFirstChild(geoName)
+	for _, child in ipairs(MapLoader.active:GetChildren()) do
+		if child ~= geo then child.Parent = MapLoader.storage end
+	end
+	if not geo then
+		warn("[RoundManager] No encontre la geometria del mapa '" .. tostring(mapName) .. "' (carpeta '" .. tostring(geoName) .. "') en ServerStorage.MapasGuardados")
+		MapLoader.loaded = nil
+		state:SetAttribute("LoadedMap", "")
+		return false
+	end
+	if geo.Parent ~= MapLoader.active then
+		local poses = MapLoader.doorPoses[geo]
+		if poses then
+			MapLoader.restoreDoors(poses)
+		else
+			MapLoader.doorPoses[geo] = MapLoader.snapshotDoors(geo)
+		end
+		local parts = 0
+		for _, d in ipairs(geo:GetDescendants()) do
+			if d:IsA("BasePart") then parts += 1 end
+		end
+		geo:SetAttribute("ExpectedParts", parts)
+		geo.Parent = MapLoader.active
+		dprint("[RoundManager] Mapa cargado:", geoName, "(" .. parts .. " partes)")
+	end
+	MapLoader.loaded = geoName
+	state:SetAttribute("LoadedMap", geoName)
+	return true
+end
+
+--  Espera a que el cliente diga que ya le llego el mapa (con tope).
+function MapLoader.waitReady(player)
+	if isBot(player) or not MapLoader.loaded then return end
+	local deadline = os.clock() + MapLoader.ReadyTimeout
+	while player.Parent and MapLoader.loaded and MapLoader.ready[player] ~= MapLoader.loaded and os.clock() < deadline do
+		task.wait(0.2)
+	end
+end
+
+MapLoader.remote.OnServerEvent:Connect(function(player, geoName)
+	if type(geoName) == "string" and #geoName <= 60 then
+		MapLoader.ready[player] = geoName
+	end
+end)
+Players.PlayerRemoving:Connect(function(player)
+	MapLoader.ready[player] = nil
+	MapLoader.joining[player] = nil
+end)
+
+--==========================================================================
+--  [29/09/2026] PERSONAJES VIEJOS
+--  Al reaparecer, Roblox saca el personaje viejo del Workspace pero NO lo
+--  destruye: cada conexion que algun script le hizo (Died, HealthChanged,
+--  atributos...) lo deja vivo en memoria para siempre. En 20 minutos de
+--  Duelo por equipos son cientos. Se destruye unos segundos despues de que
+--  sale, para que lo que lo limpia en CharacterRemoving alcance a leerlo.
+--  (Si algun sistema lo vuelve a poner en el mundo como cadaver, no se toca.)
+--==========================================================================
+do
+	local OLD_CHARACTER_DELAY = 5
+	local function hookCharacterCleanup(player)
+		player.CharacterRemoving:Connect(function(character)
+			task.delay(OLD_CHARACTER_DELAY, function()
+				if character.Parent == nil then
+					character:Destroy()
+				end
+			end)
+		end)
+	end
+	for _, player in ipairs(Players:GetPlayers()) do hookCharacterCleanup(player) end
+	Players.PlayerAdded:Connect(hookCharacterCleanup)
+end
+
 local VOTE_DURATION = 15
 local ROUND_DURATION = 300
 local modes = {"FFA", "2 Teams", "4 Teams"}
@@ -140,9 +322,8 @@ local ambiences = {}
 local DEFAULT_AMBIENCE = nil
 --  [22/09/2026] Especiales (Ventisca): no van en la lista normal. En cada
 --  votacion tiran su BallotChance y, si sale, uno de ellos reemplaza a
---  una de las 3 opciones sorteadas. [28/09] Y despues se vuelve a tirar
---  por la siguiente: con mala suerte salen 2 o las 3 especiales (ver
---  rollAmbienceBallot).
+--  una de las 3 opciones sorteadas. [30/09] Cuantos salen (1, 2 o las 3)
+--  lo decide AmbienceConfig.SpecialBallot (ver rollAmbienceBallot).
 local specialAmbiences = {}			-- { { chance = 0.25, keys = {...} } }
 --  [22/09] Que mapas admite cada especial: [clave] = { maps, fallback }
 --  (va colgado de la misma tabla para no sumar locals al chunk).
@@ -159,9 +340,14 @@ do
 		--  tira su dado antes que los sueltos. Mapas y respaldo salen de
 		--  specialFor, que ya junta los de un combo (mapas = los que admiten
 		--  todos).
+		--  [30/09] Cuantos salen por boleta y cuanto pesan los combos.
+		local ballot = config.SpecialBallot or {}
+		specialAmbiences.ballotChances = ballot.Chances or { 0.25, 0.15, 0.1 }
 		for _, group in ipairs(config.SpecialGroups or {}) do
 			if #group.keys > 0 then
-				table.insert(specialAmbiences, { chance = tonumber(group.chance) or 0, keys = group.keys })
+				local weight = tonumber(group.chance) or 0
+				if #group.names > 1 then weight *= tonumber(ballot.ComboWeightMul) or 1 end
+				table.insert(specialAmbiences, { chance = weight, keys = group.keys, id = group.id })
 				local merged = config.specialFor(group.keys[1])
 				for _, key in ipairs(group.keys) do
 					specialAmbiences.byKey[key] = {
@@ -323,7 +509,8 @@ function Guardian.stripRestricted(player)
 	for _, container in ipairs({ player:FindFirstChildOfClass("Backpack"), player.Character }) do
 		if container then
 			for _, item in ipairs(container:GetChildren()) do
-				if item:IsA("Tool") and blocked[item:GetAttribute("WeaponCategory")] then
+				--  [28/09 RNG] Las armas que da la G (RngServer) no se tocan aqui.
+				if item:IsA("Tool") and blocked[item:GetAttribute("WeaponCategory")] and not item:GetAttribute("RngWeapon") then
 					item:Destroy()
 				end
 			end
@@ -393,6 +580,13 @@ local function setPlayerTeam(player, teamName)
 end
 
 local function getRoundTeamNames(modeName)
+	--  [30/09 SUPERVIVENCIA] Todos al mismo equipo (SoloTeam = "Azul"),
+	--  sin importar lo que salio en la votacion de EQUIPOS. Solo con la
+	--  ronda armada: en el lobby currentGamemode es el de la anterior.
+	if phase ~= "Lobby" and phase ~= "Voting" then
+		local solo = rulesFor(currentGamemode).SoloTeam
+		if type(solo) == "string" and teamByName[solo] then return { solo } end
+	end
 	if modeName == "2 Teams" then
 		return {"Rojo", "Azul"}
 	elseif modeName == "4 Teams" then
@@ -582,33 +776,39 @@ end
 local function rollAmbienceBallot()
 	ambienceBallot = pickBallot(ambiences, AMBIENCE_BALLOT_SIZE)
 
-	--  Especiales: se tiran los dados (el primero que gane su BallotChance
-	--  entra en una opcion normal al azar). [28/09] Si entro uno, se vuelve
-	--  a tirar por otra opcion, y asi hasta que ninguno gane o ya no queden
-	--  normales: la chance de 1 especial es la de siempre, la de 2 es esa
-	--  al cuadrado y la de 3, al cubo. Nunca el mismo especial dos veces.
-	while #ambienceBallot > 0 do
+	--  [30/09] Especiales. Antes cada especial y cada combo tiraba su propio
+	--  dado y con 20+ grupos salia al menos uno en el 83% de las votaciones
+	--  (los 3 en el 58%): nada amigable para alguien que recien empieza.
+	--  Ahora una sola tirada por opcion (AmbienceConfig.SpecialBallot.Chances:
+	--  1a, y si salio, 2a, y si salio, 3a) y CUAL entra se sortea pesado por
+	--  BallotChance (los combos pesan menos). Nunca el mismo grupo dos veces.
+	local used = {}
+	for slot = 1, #ambienceBallot do
+		local chance = tonumber(specialAmbiences.ballotChances and specialAmbiences.ballotChances[slot]) or 0
+		if chance <= 0 or math.random() >= chance then break end
 		local normalSlots = {}
 		for index, key in ipairs(ambienceBallot) do
 			if not specialAmbiences.byKey[key] then table.insert(normalSlots, index) end
 		end
 		if #normalSlots == 0 then break end
-		local picked = nil
+		local total = 0
 		for _, special in ipairs(specialAmbiences) do
-			if math.random() < special.chance then
-				local fresh = {}
-				for _, key in ipairs(special.keys) do
-					if not table.find(ambienceBallot, key) then table.insert(fresh, key) end
-				end
-				if #fresh > 0 then
-					picked = fresh[math.random(1, #fresh)]
-					break
-				end
+			if not used[special] and special.chance > 0 then total += special.chance end
+		end
+		if total <= 0 then break end
+		local roll, picked = math.random() * total, nil
+		for _, special in ipairs(specialAmbiences) do
+			if not used[special] and special.chance > 0 then
+				picked = special
+				roll -= special.chance
+				if roll <= 0 then break end
 			end
 		end
 		if not picked then break end
-		ambienceBallot[normalSlots[math.random(1, #normalSlots)]] = picked
-		dprint("[RoundManager] Salio ambiente especial en la boleta:", picked)
+		used[picked] = true
+		local key = picked.keys[math.random(1, #picked.keys)]
+		ambienceBallot[normalSlots[math.random(1, #normalSlots)]] = key
+		dprint("[RoundManager] Salio ambiente especial en la boleta:", key)
 	end
 	table.sort(ambienceBallot)
 	return ambienceBallot
@@ -710,6 +910,22 @@ local function preparePlayerForRound(player)
 				Guardian.setLeader(roundTeam, player)
 			end
 		end
+	end
+	--  [28/09 RNG] Primaria, secundaria y terciaria no se entregan: las
+	--  armas salen con la G (RngServer). Melee y misc si. Los bots eligen
+	--  las suyas al azar en BotServer, por eso a ellos no se les pone.
+	local rngRules = rulesFor(currentGamemode).RandomWeapons
+	if rngRules and not isBot(player) then
+		player:SetAttribute("RestrictedSlots", rngRules.RestrictedSlots)
+		Guardian.stripRestricted(player)
+	end
+	--  [29/09 CARRERA ARMAMENTISTA] Igual que RNG: primaria, secundaria y
+	--  terciaria no se entregan; el arma de cada nivel la da GunGameServer.
+	--  A los bots tampoco (su arma la cambia BotServer por nivel).
+	local gunGameRules = rulesFor(currentGamemode).GunGame
+	if gunGameRules and not isBot(player) then
+		player:SetAttribute("RestrictedSlots", gunGameRules.RestrictedSlots)
+		Guardian.stripRestricted(player)
 	end
 	player:SetAttribute("CanUseRoundTools", false)
 	clearPlayerTools(player)
@@ -1990,6 +2206,22 @@ local function shouldEndRoundEarly(elapsed)
 	--  [26/09 Control] Solo termina antes si alguien llego al limite de puntos.
 	if rules.Control then return Control.limitReached(rules) end
 
+	--  [29/09 CARRERA ARMAMENTISTA] Termina en cuanto GunGameServer publica
+	--  al ganador (el que llego a la baja 31).
+	if rules.GunGame then return state:GetAttribute("GunGameWinner") ~= nil end
+
+	--  [30/09 SUPERVIVENCIA] Todos son del mismo equipo: no hay "ultimo en
+	--  pie". Se corta cuando ya no queda NADIE vivo (pasada la entrada).
+	if rules.Survival then
+		if elapsed < (tonumber(rules.JoinWindow) or 0) + 3 then return false end
+		for _, player in ipairs(participants()) do
+			if player:GetAttribute("InRound") == true and not eliminatedPlayers[player.UserId] then
+				return false
+			end
+		end
+		return true
+	end
+
 	if not rules.EndWhenOneLeft then return false end
 	if elapsed < (rules.GraceSeconds or 10) then return false end
 	if peakRoundPlayers < 2 then return false end
@@ -2147,6 +2379,7 @@ local function startRound(mapName, modeName, firstPlayer)
 	local rules = rulesFor(currentGamemode)
 	local joinWindow = tonumber(rules.JoinWindow) or 0
 	joinClosesClock = joinWindow > 0 and (os.clock() + joinWindow) or 0
+	state:SetAttribute("GunGameWinner", nil)		-- [29/09 Carrera] ganador de la anterior
 	state:SetAttribute("ActiveGamemode", currentGamemode)
 	state:SetAttribute("JoinClosesAt", joinWindow > 0 and (Workspace:GetServerTimeNow() + joinWindow) or 0)
 
@@ -2216,6 +2449,15 @@ end)
 playEvent.OnServerEvent:Connect(function(player)
 	if not player or not player.Parent or player:GetAttribute("InRound") == true then return end
 	if eliminatedPlayers[player.UserId] then return end
+	--  [29/09 MAPAS] Esperar a que a este cliente le haya llegado el mapa.
+	if MapLoader.loaded and MapLoader.ready[player] ~= MapLoader.loaded then
+		if MapLoader.joining[player] then return end
+		MapLoader.joining[player] = true
+		MapLoader.waitReady(player)
+		MapLoader.joining[player] = nil
+		if not player.Parent or player:GetAttribute("InRound") == true then return end
+		if eliminatedPlayers[player.UserId] then return end
+	end
 	if phase == "Round" then
 		joinActiveRound(player)
 		return
@@ -2341,6 +2583,15 @@ end
 ensureLobbyPlatform()
 
 --==========================================================================
+--  [29/09/2026] PARTIDA FORZADA DESDE EL PANEL DE ADMIN
+--  pending = { map, mode, gamemode, ambience }: lo que falte lo decide la
+--  votacion. Se usa UNA sola vez (la siguiente partida) y se borra.
+--  endVote = true corta la votacion en curso. El canal para AdminServer
+--  (ServerStorage.AdminMatchControl) se arma al final del script.
+--==========================================================================
+local AdminForce = { pending = nil, endVote = false }
+
+--==========================================================================
 --  [F-17] CICLO DE RONDA
 --
 --  El cuerpo del while paso a ser esta funcion para poder envolverlo en un
@@ -2358,6 +2609,7 @@ local function runRoundCycle()
 	joinClosesClock = 0
 	state:SetAttribute("ActiveGamemode", "")
 	state:SetAttribute("JoinClosesAt", 0)
+	state:SetAttribute("GunGameWinner", nil)		-- [29/09 Carrera]
 	resetTeamLives(false)			-- [22/09] se limpian las del duelo anterior
 	Guardian.reset()				-- [22/09] y el Guardian
 	pcall(Control.stop, true)		-- [26/09] y el marcador de Control
@@ -2390,16 +2642,30 @@ local function runRoundCycle()
 	dprint("[RoundManager] Boleta de ambientes:", table.concat(ambienceOptions, ", "))
 
 	setState("Voting", VOTE_DURATION, "", "", false)
+	AdminForce.endVote = false
 	for remaining = VOTE_DURATION, 1, -1 do
+		if AdminForce.endVote then break end		-- [29/09] el admin pidio votar ya
 		for _, player in ipairs(Players:GetPlayers()) do enforceLobbyTools(player) end
 		state.TimeLeft.Value = remaining
 		broadcastState(remaining)
 		task.wait(1)
 	end
+	AdminForce.endVote = false
 
 	local winningMap = chooseWinner(mapVotes, ballot)
 	local winningMode = chooseWinner(modeVotes, modes)
 	local winningGamemode = chooseWinner(gamemodeVotes, gamemodeOptions) or DEFAULT_GAMEMODE
+	--  [29/09] Lo que forzo el admin pisa a la votacion (una sola vez).
+	local forced = AdminForce.pending
+	AdminForce.pending = nil
+	if forced then
+		winningMap = forced.map or winningMap
+		winningMode = forced.mode or winningMode
+		winningGamemode = forced.gamemode or winningGamemode
+		print(string.format("[RoundManager] Partida forzada por admin: mapa=%s equipos=%s modo=%s clima=%s",
+			tostring(forced.map or "(voto)"), tostring(forced.mode or "(voto)"),
+			tostring(forced.gamemode or "(voto)"), tostring(forced.ambience or "(voto)")))
+	end
 	--  [26/09] Un modo que necesita una pieza del mapa (Control: AreaObjetivo)
 	--  no se juega en un mapa que no la tiene: esa partida va en Arcade.
 	local requiredPart = rulesFor(winningGamemode).RequiresPart
@@ -2425,10 +2691,12 @@ local function runRoundCycle()
 		winningMode = forcedTeams
 	end
 	local winningAmbience = chooseWinner(ambienceVotes, ambienceOptions) or DEFAULT_AMBIENCE or ""
+	if forced and forced.ambience then winningAmbience = forced.ambience end	-- [29/09]
 	--  [22/09] Gano un ambiente especial pero el mapa ganador no lo admite
 	--  (ej. Ventisca en el Metro): esa partida va con el de respaldo.
+	--  [29/09] Si el clima lo forzo el admin, se respeta igual.
 	local specialRule = specialAmbiences.byKey[winningAmbience]
-	if specialRule and specialRule.maps and not specialRule.maps[winningMap] then
+	if specialRule and specialRule.maps and not specialRule.maps[winningMap] and not (forced and forced.ambience) then
 		dprint("[RoundManager]", winningAmbience, "no se juega en", winningMap, "-> queda", specialRule.fallback)
 		winningAmbience = specialRule.fallback or DEFAULT_AMBIENCE or ""
 	end
@@ -2437,6 +2705,11 @@ local function runRoundCycle()
 	pendingModeName = winningMode
 	pendingGamemodeName = winningGamemode
 	dprint("[RoundManager] Ganadores: mapa =", winningMap, "modo =", winningMode, "| juego =", winningGamemode, "| ambiente =", winningAmbience)
+
+	--  [29/09 MAPAS] La geometria del ganador pasa a Workspace (y la anterior
+	--  vuelve a ServerStorage) ANTES de publicar WinningMap: el clima, la
+	--  camara del menu y los bots la buscan cuando cambia.
+	MapLoader.load(winningMap)
 
 	if not prepareRound(winningMap, winningMode) then
 		pendingMapName = nil
@@ -2506,6 +2779,167 @@ do
 			end
 		end
 		warn("[RoundManager] No encontre el mapa 'Prision'." .. hint)
+	end
+end
+
+--==========================================================================
+--  [29/09/2026] CANAL DEL PANEL DE ADMIN: FORZAR LA PARTIDA
+--  ServerStorage.AdminMatchControl (BindableFunction, solo servidor):
+--    :Invoke("options")        -> true, "", info
+--    :Invoke("force", datos)   -> ok, mensaje, info
+--        datos = { map, mode, gamemode, ambience, now }
+--        (lo que venga nil lo decide la votacion; now = cortar la
+--        votacion en curso)
+--    :Invoke("clear")          -> true, mensaje, info
+--  Antes / durante la votacion: se guarda y se aplica al terminar.
+--  Ya votado y esperando JUGAR: se cambia la partida que va a empezar.
+--  Con la partida en curso: queda para la SIGUIENTE.
+--==========================================================================
+do
+	local channel = ServerStorage:FindFirstChild("AdminMatchControl")
+	if not channel then
+		channel = Instance.new("BindableFunction")
+		channel.Name = "AdminMatchControl"
+		channel.Parent = ServerStorage
+	end
+
+	local ambienceConfig = nil
+	pcall(function() ambienceConfig = require(ReplicatedStorage:WaitForChild("AmbienceConfig", 5)) end)
+
+	local function mapLabel(name)
+		return forcedMapNames[name] or displayMapName(name)
+	end
+
+	local function gamemodeLabel(name)
+		local rules = GAMEMODE_RULES[name]
+		return (rules and (rules.RoundLabel or rules.Label)) or name
+	end
+
+	local function waitingToStart()
+		return phase == "Lobby" and state.PlayUnlocked.Value == true and pendingMapName ~= nil and pendingModeName ~= nil
+	end
+
+	local function snapshot()
+		local maps = {}
+		for _, name in ipairs(getMaps(false)) do
+			table.insert(maps, { id = name, label = mapLabel(name) })
+		end
+		local gamemodeList = {}
+		for _, name in ipairs(gamemodes) do
+			table.insert(gamemodeList, { id = name, label = gamemodeLabel(name) })
+		end
+		local pending = AdminForce.pending
+		return {
+			phase = phase,
+			waiting = waitingToStart(),
+			maps = maps,
+			modes = table.clone(modes),
+			gamemodes = gamemodeList,
+			pending = pending and table.clone(pending) or nil,
+			current = waitingToStart() and {
+				map = pendingMapName, mode = pendingModeName,
+				gamemode = pendingGamemodeName, ambience = state:GetAttribute("WinningAmbience"),
+			} or nil,
+		}
+	end
+
+	local function validate(data)
+		if type(data) ~= "table" then return nil, "Datos invalidos" end
+		local f = {}
+		if data.map ~= nil then
+			for _, name in ipairs(getMaps(true)) do
+				if name == data.map or mapLabel(name) == data.map then f.map = name end
+			end
+			if not f.map then return nil, "Ese mapa no existe: " .. tostring(data.map) end
+		end
+		if data.mode ~= nil then
+			if not table.find(modes, data.mode) then return nil, "Tipo de equipos invalido: " .. tostring(data.mode) end
+			f.mode = data.mode
+		end
+		if data.gamemode ~= nil then
+			if not GAMEMODE_RULES[data.gamemode] then return nil, "Ese modo de juego no existe: " .. tostring(data.gamemode) end
+			f.gamemode = data.gamemode
+		end
+		if data.ambience ~= nil then
+			if not (ambienceConfig and ambienceConfig.Presets and ambienceConfig.Presets[data.ambience]) then
+				return nil, "Ese clima no existe: " .. tostring(data.ambience)
+			end
+			f.ambience = data.ambience
+		end
+		if next(f) == nil then return nil, "No elegiste nada para forzar" end
+		--  Un modo que necesita una pieza del mapa (Control) no va en un mapa
+		--  que no la tiene: se avisa ahora y no al arrancar.
+		local gm = f.gamemode
+		local needs = gm and rulesFor(gm).RequiresPart
+		local mapName = f.map or (waitingToStart() and pendingMapName) or nil
+		if needs and mapName then
+			local ok, area = pcall(Control.findArea, getMap(mapName), needs)
+			if not ok or not area then
+				return nil, gamemodeLabel(gm) .. " necesita '" .. needs .. "' y " .. mapLabel(mapName) .. " no la tiene"
+			end
+		end
+		return f
+	end
+
+	local function describe(f)
+		local parts = {}
+		if f.map then table.insert(parts, mapLabel(f.map)) end
+		if f.mode then table.insert(parts, f.mode) end
+		if f.gamemode then table.insert(parts, gamemodeLabel(f.gamemode)) end
+		if f.ambience then
+			table.insert(parts, ambienceConfig and ambienceConfig.labelFor(f.ambience) or f.ambience)
+		end
+		return table.concat(parts, " / ")
+	end
+
+	--  Ya se voto y se espera a que alguien le de a JUGAR: se cambia esa.
+	local function applyToWaiting(f)
+		local mapName = f.map or pendingMapName
+		local modeName = f.mode or pendingModeName
+		local gm = f.gamemode or pendingGamemodeName or DEFAULT_GAMEMODE
+		local forcedTeams = rulesFor(gm).ForceTeams
+		if forcedTeams and modeName == "FFA" then modeName = forcedTeams end
+		MapLoader.load(mapName)		-- [29/09 MAPAS] el mapa forzado tambien tiene que estar cargado
+		if not prepareRound(mapName, modeName) then
+			return false, "No se pudo preparar el mapa " .. tostring(mapName)
+		end
+		pendingMapName, pendingModeName, pendingGamemodeName = mapName, modeName, gm
+		state:SetAttribute("WinningGamemode", gm)
+		if f.ambience then state:SetAttribute("WinningAmbience", f.ambience) end
+		setState("Lobby", 0, mapName, modeName, true)
+		return true
+	end
+
+	channel.OnInvoke = function(action, data)
+		if action == "options" then
+			return true, "", snapshot()
+		elseif action == "clear" then
+			AdminForce.pending = nil
+			return true, "Sin forzar: decide la votación", snapshot()
+		elseif action ~= "force" then
+			return false, "Acción desconocida", snapshot()
+		end
+
+		local f, err = validate(data)
+		if not f then return false, err, snapshot() end
+		local text = describe(f)
+
+		if phase == "Round" or phase == "Ready" then
+			AdminForce.pending = f
+			return true, "La partida ya empezó: " .. text .. " queda para la SIGUIENTE", snapshot()
+		end
+		if waitingToStart() then
+			local ok, why = applyToWaiting(f)
+			if not ok then return false, why, snapshot() end
+			AdminForce.pending = nil
+			return true, "Aplicado a la partida que va a empezar: " .. text, snapshot()
+		end
+		AdminForce.pending = f
+		if type(data) == "table" and data.now == true and phase == "Voting" then
+			AdminForce.endVote = true
+			return true, "Votación cortada: se juega " .. text, snapshot()
+		end
+		return true, "Se aplica al terminar la votación: " .. text, snapshot()
 	end
 end
 
