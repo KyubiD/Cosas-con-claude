@@ -57,7 +57,7 @@ self.Ballesta = {
 		Low    = { Pos = Vector3.new(-0.10, -0.25, 0.05), Rot = Vector3.new(-20, 25, 15) },
 		Patrol = { Pos = Vector3.new(-0.10, -0.25, 0.05), Rot = Vector3.new(-20, 25, 15) },
 		High   = { Pos = Vector3.new(0, 0.10, 0),         Rot = Vector3.new(30, 10, -10) },
-		Reload = { Pos = Vector3.new(-0.05, -0.20, 0.10), Rot = Vector3.new(-38, 12, -32) },
+		Reload = { Pos = Vector3.new(-0.15, -0.10, 0.05), Rot = Vector3.new(12, 25, 22) },
 		Check  = { Pos = Vector3.new(0, -0.05, -0.10),    Rot = Vector3.new(5, -30, -60) },
 		Equip  = { Pos = Vector3.new(0.20, -1.20, 0.50),  Rot = Vector3.new(-60, 20, 30) },
 	},
@@ -269,14 +269,19 @@ local function buildRig(objs)
 	rig.backDir = str and str.D or -forward
 	rig.cock = str and str.cock or (B.CockDistance or 0.6)
 
-	--  Soldaduras propias para lo que se mueve (ver el arco).
+	--  Soldaduras propias para lo que se mueve: se apaga TODA soldadura que
+	--  ate una pieza animada a otra cosa (Handle, otra pieza del modelo...),
+	--  salvo a sus propias piezas hijas, que la siguen.
+	local disabled = 0
 	for _, joint in ipairs(model:GetDescendants()) do
 		if joint:IsA("JointInstance") or joint:IsA("WeldConstraint") then
 			local a, b = joint.Part0, joint.Part1
-			if animated[a] or animated[b] then
-				local other = animated[a] and b or a
-				if other == handle or animated[other] or (other and other.Parent == model) then
+			local mine = animated[a] and a or (animated[b] and b) or nil
+			if mine then
+				local other = (mine == a) and b or a
+				if not (other and other:IsDescendantOf(mine)) and joint.Enabled then
 					joint.Enabled = false
+					disabled += 1
 				end
 			end
 		end
@@ -289,6 +294,17 @@ local function buildRig(objs)
 		weld.C0 = piece.rest
 		weld.Parent = handle
 		piece.weld = weld
+	end
+
+	--  Que se vea en Output que encontro (por si algo no se mueve).
+	local count = { str1 = 0, str2 = 0, top = 0, bot = 0, bolt = 0 }
+	for _, piece in ipairs(rig.pieces) do count[piece.kind] = (count[piece.kind] or 0) + 1 end
+	print(string.format("[Ballesta] %s: Cuerda1 x%d, Cuerda2 x%d, Clip %s, virote x%d, palas %d/%d, cuerda %s (tensada se jala %.2f studs), %d soldaduras viejas apagadas",
+		model.Name, count.str1, count.str2, partsNamed(model, B.ClipNames)[1] and "si" or "NO",
+		count.bolt, count.top, count.bot, rig.string and "SI" or "NO", rig.cock or 0, disabled))
+	if not rig.string then
+		warn("[Ballesta] Sin cuerda animada: el modelo " .. model:GetFullName()
+			.. " necesita piezas llamadas exactamente Cuerda1 y Cuerda2 (hijas directas del modelo en GunModels)")
 	end
 	return rig
 end
